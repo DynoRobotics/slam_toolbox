@@ -39,16 +39,25 @@ public:
   {
   }
 
-  bool getOdomPose(karto::Pose2 & karto_pose, const rclcpp::Time & t)
+  bool getOdomPose(karto::Pose2 & karto_pose, const rclcpp::Time & t, rclcpp::Node * node)
   {
     geometry_msgs::msg::TransformStamped base_ident, odom_pose;
     base_ident.header.stamp = t;
     base_ident.header.frame_id = base_frame_;
     base_ident.transform.rotation.w = 1.0;
+    std::string error_msg;
 
-    try {
-      odom_pose = tf_->transform(base_ident, odom_frame_);
-    } catch (tf2::TransformException & e) {
+    auto & clk = *node->get_clock();
+
+    if (tf_->canTransform(odom_frame_, base_frame_, t, rclcpp::Duration::from_nanoseconds(0), &error_msg)) {
+      try {
+        odom_pose = tf_->transform(base_ident, odom_frame_);
+      } catch (tf2::TransformException & e) {
+        RCLCPP_WARN_THROTTLE(node->get_logger(), clk, 3000, "Failed to compute odom pose");
+        return false;
+      }
+    } else {
+      RCLCPP_WARN_THROTTLE(node->get_logger(), clk, 3000, "Failed to compute odom pose");
       return false;
     }
 
