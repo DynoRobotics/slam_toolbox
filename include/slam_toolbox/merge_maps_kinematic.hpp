@@ -37,6 +37,7 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/utils.h"
+#include "slam_toolbox/snap_utils.hpp"
 
 #include "../lib/karto_sdk/include/karto_sdk/Mapper.h"
 #include "slam_toolbox/toolbox_types.hpp"
