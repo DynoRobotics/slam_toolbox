@@ -489,11 +489,15 @@ bool SlamToolbox::shouldProcessScan(
   const Pose2 & pose)
 /*****************************************************************************/
 {
+  // std::cout << "shouldProcessScan" << std::endl;
+
   static Pose2 last_pose;
   static rclcpp::Time last_scan_time = rclcpp::Time(0.);
   static double min_dist2 =
     smapper_->getMapper()->getParamMinimumTravelDistance() *
     smapper_->getMapper()->getParamMinimumTravelDistance();
+  static double min_angle =
+    math::DegreesToRadians(smapper_->getMapper()->getParamMinimumTravelHeading());
   static int scan_ctr = 0;
   scan_ctr++;
 
@@ -512,23 +516,47 @@ bool SlamToolbox::shouldProcessScan(
 
   // throttled out
   if ((scan_ctr % throttle_scans_) != 0) {
+    // std::cout << "shouldProcessScan false because of throttle" << std::endl;
     return false;
   }
 
   // not enough time
   if (rclcpp::Time(scan->header.stamp) - last_scan_time < minimum_time_interval_) {
+    // std::cout << "shouldProcessScan false because of time" << std::endl;
     return false;
   }
 
-  // check moved enough, within 10% for correction error
-  const double dist2 = last_pose.SquaredDistance(pose);
-  if (dist2 < 0.8 * min_dist2 || scan_ctr < 5) {
+  // check scan counter
+  if (scan_ctr < 5) {
+    // std::cout << "shouldProcessScan false because of scan_ctr" << std::endl;
     return false;
   }
+
+  // check dist and angle
+  const double dist2 = last_pose.SquaredDistance(pose);
+  const double angle = math::NormalizeAngle(pose.GetHeading() - last_pose.GetHeading());
+  const double min_distance_exceeded = dist2 > min_dist2;
+  const double min_angle_exceeded = fabs(angle) > min_angle;
+
+  // std::cout << "fabs(angle): " << fabs(angle) << std::endl;
+  // std::cout << "min_angle: " << min_angle << std::endl;
+  // std::cout << "dist2: " << dist2 << std::endl;
+  // std::cout << "min_angle: " << min_angle << std::endl;
+  
+  if (!min_angle_exceeded && !min_distance_exceeded) {
+    // std::cout << "shouldProcessScan false because of dist or angle" << std::endl;
+    // std::cout << "min_dist_exceeded: " << min_distance_exceeded << std::endl;
+    // std::cout << "min_angle_exceeded: " << min_angle_exceeded << std::endl;
+    return false;
+  }
+
+  // std::cout << "min_dist_exceeded: " << min_distance_exceeded << std::endl;
+  // std::cout << "min_angle_exceeded: " << min_angle_exceeded << std::endl;
 
   last_pose = pose;
   last_scan_time = scan->header.stamp;
 
+  // std::cout << "shouldProcessScan true" << std::endl;
   return true;
 }
 
