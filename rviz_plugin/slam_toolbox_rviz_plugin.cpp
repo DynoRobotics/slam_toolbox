@@ -378,7 +378,7 @@ void SlamToolboxPlugin::GenerateMap()
   auto result_future = _merge->async_send_request(request);
 
   if (rclcpp::spin_until_future_complete(ros_node_, result_future,
-    std::chrono::seconds(5)) !=
+    std::chrono::seconds(50)) !=
     rclcpp::FutureReturnCode::SUCCESS)
   {
     RCLCPP_WARN(
