@@ -168,6 +168,7 @@ SlamToolboxPlugin::SlamToolboxPlugin(QWidget * parent)
   _line5 = new QLineEdit();
   _line6 = new QLineEdit();
   _line7 = new QLineEdit();
+  _line8 = new QLineEdit();
 
   _button1->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   _button2->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -186,6 +187,7 @@ SlamToolboxPlugin::SlamToolboxPlugin(QWidget * parent)
   _line5->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   _line6->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
   _line7->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+  _line8->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 
   _hbox1->addWidget(_check1);
   _hbox1->addWidget(_label1);
@@ -204,6 +206,7 @@ SlamToolboxPlugin::SlamToolboxPlugin(QWidget * parent)
   _hbox5->addWidget(_line2);
 
   _hbox6->addWidget(_button6);
+  _hbox6->addWidget(_line8);
 
   _hbox7->addWidget(_button7);
   _hbox7->addWidget(_line3);
@@ -371,10 +374,11 @@ void SlamToolboxPlugin::GenerateMap()
 /*****************************************************************************/
 {
   auto request = std::make_shared<slam_toolbox::srv::MergeMaps::Request>();
+  request->filename = _line8->text().toStdString();
   auto result_future = _merge->async_send_request(request);
 
   if (rclcpp::spin_until_future_complete(ros_node_, result_future,
-    std::chrono::seconds(5)) !=
+    std::chrono::seconds(50)) !=
     rclcpp::FutureReturnCode::SUCCESS)
   {
     RCLCPP_WARN(
