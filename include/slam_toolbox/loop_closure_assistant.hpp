@@ -24,10 +24,13 @@
 #include <functional>
 #include <memory>
 #include <map>
+#include <unordered_map>
 
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/utils.h"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "interactive_markers/interactive_marker_server.hpp"
 #include "interactive_markers/menu_handler.hpp"
@@ -47,7 +50,7 @@ public:
   LoopClosureAssistant(
     rclcpp::Node::SharedPtr node, karto::Mapper * mapper,
     laser_utils::ScanHolder * scan_holder, PausedState & state,
-    ProcessType & processor_type);
+    ProcessType & processor_type, tf2_ros::Buffer * tf);
 
   void clearMovedNodes();
   void processInteractiveFeedback(
@@ -71,11 +74,16 @@ private:
 
   void moveNode(const int& id, const Eigen::Vector3d& pose);
   void addMovedNodes(const int& id, Eigen::Vector3d vec);
+  void publishExtrinsicCalibration();
+  bool isLidarFrameInverted();
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tfB_;
+  tf2_ros::Buffer * tf_;
   laser_utils::ScanHolder * scan_holder_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr extrinsic_pub_;
+  rclcpp::TimerBase::SharedPtr extrinsic_publish_timer_;
   rclcpp::Service<slam_toolbox::srv::Clear>::SharedPtr ssClear_manual_;
   rclcpp::Service<slam_toolbox::srv::LoopClosure>::SharedPtr ssLoopClosure_;
   rclcpp::Service<slam_toolbox::srv::ToggleInteractive>::SharedPtr ssInteractive_;
@@ -88,6 +96,13 @@ private:
   bool interactive_mode_, enable_interactive_mode_;
   rclcpp::Node::SharedPtr node_;
   std::string map_frame_;
+  std::string base_frame_;
+  std::string lidar_frame_;
+  bool lidar_frame_inversion_checked_ = false;
+  bool lidar_frame_inverted_ = false;
+  boost::mutex extrinsic_mutex_;
+  std::unordered_map<std::string, geometry_msgs::msg::PoseWithCovarianceStamped>
+    last_extrinsic_msgs_;
   PausedState & state_;
   ProcessType & processor_type_;
 };

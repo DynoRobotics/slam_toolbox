@@ -192,6 +192,21 @@ void SMapper::configure(const rclcpp::Node::SharedPtr & node)
   node->get_parameter("loop_match_minimum_chain_size", loop_match_minimum_chain_size);
   mapper_->setParamLoopMatchMinimumChainSize(loop_match_minimum_chain_size);
 
+  bool enable_periodic_pose_graph_solve = false;
+  if (!node->has_parameter("enable_periodic_pose_graph_solve")) {
+    node->declare_parameter(
+      "enable_periodic_pose_graph_solve", enable_periodic_pose_graph_solve);
+  }
+  node->get_parameter("enable_periodic_pose_graph_solve", enable_periodic_pose_graph_solve);
+  mapper_->setParamEnablePeriodicPoseGraphSolve(enable_periodic_pose_graph_solve);
+
+  int periodic_solve_interval_nodes = 20;
+  if (!node->has_parameter("periodic_solve_interval_nodes")) {
+    node->declare_parameter("periodic_solve_interval_nodes", periodic_solve_interval_nodes);
+  }
+  node->get_parameter("periodic_solve_interval_nodes", periodic_solve_interval_nodes);
+  mapper_->setParamPeriodicSolveIntervalNodes(periodic_solve_interval_nodes);
+
   double loop_match_maximum_variance_coarse = 3.0;
   if (!node->has_parameter("loop_match_maximum_variance_coarse")) {
     node->declare_parameter(

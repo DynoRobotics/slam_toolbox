@@ -180,14 +180,19 @@ add_executable(merge_maps_kinematic src/merge_maps_kinematic.cpp)
 target_link_libraries(merge_maps_kinematic kartoSlamToolbox toolbox_common)
 
 #### testing
-#if(BUILD_TESTING)
-#  find_package(ament_cmake_gtest REQUIRED)
-#  find_package(ament_lint_auto REQUIRED)
-#  ament_lint_auto_find_test_dependencies()
-#  include_directories(test)
-#  ament_add_gtest(lifelong_metrics_test test/lifelong_metrics_test.cpp)
-#  target_link_libraries(lifelong_metrics_test lifelong_slam_toolbox)
-#endif()
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_lint_auto REQUIRED)
+  ament_lint_auto_find_test_dependencies()
+  include_directories(test)
+  ament_add_gtest(lifelong_metrics_test test/lifelong_metrics_test.cpp)
+  target_link_libraries(lifelong_metrics_test lifelong_slam_toolbox)
+
+  ament_add_gtest(ceres_extrinsic_test test/ceres_extrinsic_test.cpp)
+  ament_target_dependencies(ceres_extrinsic_test ${dependencies})
+  target_link_libraries(ceres_extrinsic_test ceres_solver_plugin kartoSlamToolbox
+                                              ${CERES_LIBRARIES})
+endif()
 
 rclcpp_components_register_nodes(async_slam_toolbox "slam_toolbox::AsynchronousSlamToolbox")
 rclcpp_components_register_nodes(sync_slam_toolbox "slam_toolbox::SynchronousSlamToolbox")

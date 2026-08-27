@@ -35,6 +35,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "Karto.h"  // NOLINT
 #include "nanoflann_adaptors.h"  // NOLINT
+#include <boost/serialization/version.hpp>  // NOLINT
 
 
 namespace karto
@@ -223,11 +224,107 @@ public:
     return m_Covariance;
   }
 
+  /**
+   * Changes the link information to also record the sensor-frame (not robot-frame) relative
+   * pose and covariance the measurement was actually made in. Used for online joint
+   * lidar<->base_link extrinsic calibration: the robot-frame pose difference above already has
+   * the (possibly wrong) sensor offset baked in and removed, so it cannot be used to re-derive
+   * the offset. This keeps the raw sensor-frame measurement around instead.
+   * @param rSensorPose1
+   * @param rSensorPose2
+   * @param rCovariance
+   */
+  void UpdateSensorFrame(
+    const Pose2 & rSensorPose1, const Pose2 & rSensorPose2,
+    const Matrix3 & rCovariance)
+  {
+    Transform transform(rSensorPose1, Pose2());
+    m_SensorPoseDifference = transform.TransformPose(rSensorPose2);
+
+    Matrix3 rotationMatrix;
+    rotationMatrix.FromAxisAngle(0, 0, 1, -rSensorPose1.GetHeading());
+
+    m_SensorCovariance = rotationMatrix * rCovariance * rotationMatrix.Transpose();
+    m_HasSensorFrameData = true;
+  }
+
+  /**
+   * Gets the sensor-frame pose difference
+   * @return sensor-frame pose difference
+   */
+  inline const Pose2 & GetSensorPoseDifference()
+  {
+    return m_SensorPoseDifference;
+  }
+
+  /**
+   * Gets the sensor-frame link covariance
+   * @return sensor-frame link covariance
+   */
+  inline const Matrix3 & GetSensorCovariance()
+  {
+    return m_SensorCovariance;
+  }
+
+  /**
+   * Whether this link was constructed with sensor-frame data (false for edges loaded from a
+   * pose graph serialized before extrinsic calibration support was added)
+   * @return true if sensor-frame data is present
+   */
+  inline kt_bool HasSensorFrameData() const
+  {
+    return m_HasSensorFrameData;
+  }
+
+  /**
+   * Changes the link information to also record the *odometry-frame* relative pose between the
+   * two scans -- i.e. the robot-frame motion as measured independently of the lidar (from
+   * LocalizedRangeScan::GetOdometricPose(), which traces back to fused wheel+IMU odometry via
+   * TF, not scan matching). This is what makes the lidar<->base_link extrinsic identifiable at
+   * all when jointly optimized: a sensor-frame-only pose graph has an exact SE(2) conjugation
+   * symmetry in the extrinsic (see PLAN.md addendum), the same reason hand-eye calibration
+   * needs two independent measurement streams of the same motion (AX=XB), not one.
+   * @param rOdomPose1
+   * @param rOdomPose2
+   */
+  void UpdateOdometryFrame(const Pose2 & rOdomPose1, const Pose2 & rOdomPose2)
+  {
+    Transform transform(rOdomPose1, Pose2());
+    m_OdomPoseDifference = transform.TransformPose(rOdomPose2);
+    m_HasOdomFrameData = true;
+  }
+
+  /**
+   * Gets the odometry-frame pose difference
+   * @return odometry-frame pose difference
+   */
+  inline const Pose2 & GetOdomPoseDifference()
+  {
+    return m_OdomPoseDifference;
+  }
+
+  /**
+   * Whether this link was constructed with odometry-frame data (false for edges loaded from a
+   * pose graph serialized before this was added)
+   * @return true if odometry-frame data is present
+   */
+  inline kt_bool HasOdomFrameData() const
+  {
+    return m_HasOdomFrameData;
+  }
+
 private:
   Pose2 m_Pose1;
   Pose2 m_Pose2;
   Pose2 m_PoseDifference;
   Matrix3 m_Covariance;
+
+  Pose2 m_SensorPoseDifference;
+  Matrix3 m_SensorCovariance;
+  kt_bool m_HasSensorFrameData = false;
+
+  Pose2 m_OdomPoseDifference;
+  kt_bool m_HasOdomFrameData = false;
 
   friend class boost::serialization::access;
   template<class Archive>
@@ -238,6 +335,19 @@ private:
     ar & BOOST_SERIALIZATION_NVP(m_Pose2);
     ar & BOOST_SERIALIZATION_NVP(m_PoseDifference);
     ar & BOOST_SERIALIZATION_NVP(m_Covariance);
+    if (version >= 1) {
+      ar & BOOST_SERIALIZATION_NVP(m_SensorPoseDifference);
+      ar & BOOST_SERIALIZATION_NVP(m_SensorCovariance);
+      ar & BOOST_SERIALIZATION_NVP(m_HasSensorFrameData);
+    } else if (Archive::is_loading::value) {
+      m_HasSensorFrameData = false;
+    }
+    if (version >= 2) {
+      ar & BOOST_SERIALIZATION_NVP(m_OdomPoseDifference);
+      ar & BOOST_SERIALIZATION_NVP(m_HasOdomFrameData);
+    } else if (Archive::is_loading::value) {
+      m_HasOdomFrameData = false;
+    }
   }
 };    // LinkInfo
 
@@ -927,6 +1037,13 @@ private:
   GraphTraversal<LocalizedRangeScan> * m_pTraversal;
 
   /**
+   * Nodes added since the last periodic pose graph solve (see
+   * Mapper::m_pEnablePeriodicPoseGraphSolve / m_pPeriodicSolveIntervalNodes). Not serialized;
+   * a fresh replay after map load simply restarts the count at zero.
+   */
+  int m_NodesSinceLastPeriodicSolve = 0;
+
+  /**
    * Serialization: class MapperGraph
    */
   friend class boost::serialization::access;
@@ -1055,6 +1172,41 @@ public:
   virtual void GetNodeOrientation(const int & unique_id, double & pose)
   {
     std::cout << "GetNodeOrientation method not implemented for this solver type." << std::endl;
+  }
+
+  /**
+   * Get the live, jointly-optimized sensor extrinsic (lidar<->base_link) offset estimates,
+   * keyed by sensor name. Empty for solvers that don't support online extrinsic calibration,
+   * or when the feature is disabled.
+   */
+  virtual const std::unordered_map<std::string, Pose2> & GetSensorOffsetCorrections() const
+  {
+    static const std::unordered_map<std::string, Pose2> empty;
+    return empty;
+  }
+
+  /**
+   * Get the marginal covariance of each sensor extrinsic offset estimate, keyed by sensor name.
+   * Empty for solvers that don't support online extrinsic calibration, when the feature is
+   * disabled, or before the first successful solve.
+   */
+  virtual const std::unordered_map<std::string, Eigen::Matrix3d> & GetSensorOffsetCovariances()
+  const
+  {
+    static const std::unordered_map<std::string, Eigen::Matrix3d> empty;
+    return empty;
+  }
+
+  /**
+   * Get the frozen nominal (TF-derived) sensor extrinsic offset each sensor's prior was
+   * anchored to, keyed by sensor name -- unlike GetSensorOffsetCorrections() this never changes
+   * after being set once. Empty for solvers that don't support online extrinsic calibration, or
+   * when the feature is disabled.
+   */
+  virtual const std::unordered_map<std::string, Pose2> & GetSensorNominalOffsets() const
+  {
+    static const std::unordered_map<std::string, Pose2> empty;
+    return empty;
   }
 
   friend class boost::serialization::access;
@@ -2285,6 +2437,19 @@ protected:
   Parameter<kt_int32u> * m_pLoopMatchMinimumChainSize;
 
   /**
+   * Enable/disable periodically re-solving the whole pose graph every
+   * m_pPeriodicSolveIntervalNodes nodes, independent of loop closure.
+   * Default is disabled.
+   */
+  Parameter<kt_bool> * m_pEnablePeriodicPoseGraphSolve;
+
+  /**
+   * Number of nodes added between periodic pose graph solves, when enabled.
+   * Default value is 20.
+   */
+  Parameter<kt_int32u> * m_pPeriodicSolveIntervalNodes;
+
+  /**
    * The co-variance values for a possible loop closure have to be less than this value
    * to consider a viable solution. This applies to the coarse search.
    * Default value is 0.16.
@@ -2444,6 +2609,8 @@ public:
   double getParamLoopSearchMaximumDistance();
   bool getParamDoLoopClosing();
   int getParamLoopMatchMinimumChainSize();
+  bool getParamEnablePeriodicPoseGraphSolve();
+  int getParamPeriodicSolveIntervalNodes();
   double getParamLoopMatchMaximumVarianceCoarse();
   double getParamLoopMatchMinimumResponseCoarse();
   double getParamLoopMatchMinimumResponseFine();
@@ -2484,6 +2651,8 @@ public:
   void setParamLoopSearchMaximumDistance(double d);
   void setParamDoLoopClosing(bool b);
   void setParamLoopMatchMinimumChainSize(int i);
+  void setParamEnablePeriodicPoseGraphSolve(bool b);
+  void setParamPeriodicSolveIntervalNodes(int i);
   void setParamLoopMatchMaximumVarianceCoarse(double d);
   void setParamLoopMatchMinimumResponseCoarse(double d);
   void setParamLoopMatchMinimumResponseFine(double d);

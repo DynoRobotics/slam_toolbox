@@ -35,6 +35,15 @@
 
 #include "karto_sdk/Mapper.h"
 
+// Must live at global scope (not inside `namespace karto`): BOOST_CLASS_VERSION expands to
+// `namespace boost { namespace serialization { ... } }`, and nesting that inside `namespace
+// karto` would define a bogus karto::boost::serialization instead of ::boost::serialization,
+// silently shadowing it for every `friend class boost::serialization::access;` declared later
+// in this translation unit.
+// v1 added sensor-frame data, v2 added odometry-frame data (both for online joint
+// lidar<->base_link extrinsic calibration -- see PLAN.md and its addendum).
+BOOST_CLASS_VERSION(karto::LinkInfo, 2)
+
 BOOST_CLASS_EXPORT(karto::MapperGraph);
 BOOST_CLASS_EXPORT(karto::Graph<karto::LocalizedRangeScan>);
 BOOST_CLASS_EXPORT(karto::EdgeLabel);
@@ -1495,6 +1504,16 @@ void MapperGraph::AddEdges(LocalizedRangeScan * pScan, const Matrix3 & rCovarian
   if (!means.empty()) {
     pScan->SetSensorPose(ComputeWeightedMean(means, covariances));
   }
+
+  if (m_pMapper->m_pEnablePeriodicPoseGraphSolve->GetValue()) {
+    ++m_NodesSinceLastPeriodicSolve;
+    if (m_NodesSinceLastPeriodicSolve >=
+      static_cast<int>(m_pMapper->m_pPeriodicSolveIntervalNodes->GetValue()))
+    {
+      m_NodesSinceLastPeriodicSolve = 0;
+      CorrectPoses();
+    }
+  }
 }
 
 kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSensorName)
@@ -1629,7 +1648,17 @@ void MapperGraph::LinkScans(
 
   // only attach link information if the edge is new
   if (isNewEdge == true) {
-    pEdge->SetLabel(new LinkInfo(pFromScan->GetCorrectedPose(), pToScan->GetCorrectedAt(rMean), rCovariance));
+    LinkInfo * pLinkInfo = new LinkInfo(
+      pFromScan->GetCorrectedPose(), pToScan->GetCorrectedAt(rMean), rCovariance);
+    // also record the raw sensor-frame measurement (before the current, possibly wrong,
+    // lidar<->base_link offset was applied/removed) so it can be used for online joint
+    // extrinsic calibration; rMean is already the matcher's sensor-frame output for pToScan.
+    pLinkInfo->UpdateSensorFrame(pFromScan->GetSensorPose(), rMean, rCovariance);
+    // and the independent odometry-frame measurement (fused wheel+IMU odometry via TF, not
+    // scan matching) -- this is what makes the extrinsic actually identifiable; see
+    // UpdateOdometryFrame's doc comment and the PLAN.md addendum.
+    pLinkInfo->UpdateOdometryFrame(pFromScan->GetOdometricPose(), pToScan->GetOdometricPose());
+    pEdge->SetLabel(pLinkInfo);
     if (m_pMapper->m_pScanOptimizer != NULL) {
       m_pMapper->m_pScanOptimizer->AddConstraint(pEdge);
     }
@@ -2025,6 +2054,25 @@ void MapperGraph::CorrectPoses()
       scan->SetCorrectedPoseAndUpdate(iter->second);
     }
 
+    // feed the jointly-optimized sensor extrinsic estimate (if any) back into karto: this
+    // instantly and retroactively affects GetSensorPose()/GetSensorAt() for every scan of that
+    // sensor, so mark them dirty to force cached point clouds to be rebuilt against it.
+    for (const auto & sensorCorrection : pSolver->GetSensorOffsetCorrections()) {
+      const Name sensorName(sensorCorrection.first);
+      LaserRangeFinder * pLrf =
+        SensorManager::GetInstance()->GetSensorByName<LaserRangeFinder>(sensorName);
+      if (pLrf) {
+        pLrf->SetOffsetPose(sensorCorrection.second);
+        LocalizedRangeScanMap & scans = m_pMapper->m_pMapperSensorManager->GetScans(sensorName);
+        kt_bool dirty = true;
+        for (auto & idScan : scans) {
+          if (idScan.second) {
+            idScan.second->SetIsDirty(dirty);
+          }
+        }
+      }
+    }
+
     pSolver->Clear();
   }
 }
@@ -2183,6 +2231,17 @@ void Mapper::InitializeParameters()
     "a large set of linked scans. If the chain of scans is less than this "
     "value we do not attempt to close the loop.",
     10, GetParameterManager());
+
+  m_pEnablePeriodicPoseGraphSolve = new Parameter<kt_bool>(
+    "EnablePeriodicPoseGraphSolve",
+    "Enable/disable periodically re-solving the whole pose graph every "
+    "PeriodicSolveIntervalNodes nodes, independent of loop closure.",
+    false, GetParameterManager());
+
+  m_pPeriodicSolveIntervalNodes = new Parameter<kt_int32u>(
+    "PeriodicSolveIntervalNodes",
+    "Number of nodes added between periodic pose graph solves, when enabled.",
+    20, GetParameterManager());
 
   m_pLoopMatchMaximumVarianceCoarse = new Parameter<kt_double>(
     "LoopMatchMaximumVarianceCoarse",
@@ -2368,6 +2427,16 @@ int Mapper::getParamLoopMatchMinimumChainSize()
   return static_cast<int>(m_pLoopMatchMinimumChainSize->GetValue());
 }
 
+bool Mapper::getParamEnablePeriodicPoseGraphSolve()
+{
+  return static_cast<bool>(m_pEnablePeriodicPoseGraphSolve->GetValue());
+}
+
+int Mapper::getParamPeriodicSolveIntervalNodes()
+{
+  return static_cast<int>(m_pPeriodicSolveIntervalNodes->GetValue());
+}
+
 double Mapper::getParamLoopMatchMaximumVarianceCoarse()
 {
   return static_cast<double>(std::sqrt(m_pLoopMatchMaximumVarianceCoarse->GetValue()));
@@ -2529,6 +2598,16 @@ void Mapper::setParamDoLoopClosing(bool b)
 void Mapper::setParamLoopMatchMinimumChainSize(int i)
 {
   m_pLoopMatchMinimumChainSize->SetValue((kt_int32u)i);
+}
+
+void Mapper::setParamEnablePeriodicPoseGraphSolve(bool b)
+{
+  m_pEnablePeriodicPoseGraphSolve->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamPeriodicSolveIntervalNodes(int i)
+{
+  m_pPeriodicSolveIntervalNodes->SetValue((kt_int32u)i);
 }
 
 void Mapper::setParamLoopMatchMaximumVarianceCoarse(double d)

@@ -15,7 +15,10 @@ namespace solver_plugins
 CeresSolver::CeresSolver()
 : nodes_(new std::unordered_map<int, Eigen::Vector3d>()),
   blocks_(new std::unordered_map<std::size_t,
-    ceres::ResidualBlockId>()),
+    std::vector<ceres::ResidualBlockId>>()),
+  sensor_offsets_(new std::unordered_map<std::string, Eigen::Vector3d>()),
+  sensor_offsets_initialized_(new std::unordered_set<std::string>()),
+  sensor_offset_covariances_(new std::unordered_map<std::string, Eigen::Matrix3d>()),
   problem_(NULL), was_constant_set_(false)
 /*****************************************************************************/
 {
@@ -41,6 +44,17 @@ void CeresSolver::Configure(rclcpp::Node::SharedPtr node)
       std::string("None"));
   mode = node->declare_parameter("mode", std::string("mapping"));
   debug_logging_ = node->get_parameter("debug_logging").as_bool();
+
+  optimize_sensor_extrinsics_ = node->declare_parameter(
+    "optimize_sensor_extrinsics", false);
+  extrinsic_prior_stddev_xy_ = node->declare_parameter(
+    "extrinsic_prior_stddev_xy", 0.02);
+  extrinsic_prior_stddev_yaw_ = node->declare_parameter(
+    "extrinsic_prior_stddev_yaw", 0.02);
+  odometry_edge_stddev_xy_ = node->declare_parameter(
+    "odometry_edge_stddev_xy", 0.03);
+  odometry_edge_stddev_yaw_ = node->declare_parameter(
+    "odometry_edge_stddev_yaw", 0.02);
 
   corrections_.clear();
   first_node_ = nodes_->end();
@@ -123,7 +137,7 @@ void CeresSolver::Configure(rclcpp::Node::SharedPtr node)
   options_.max_num_consecutive_invalid_steps = 3;
   options_.max_consecutive_nonmonotonic_steps =
     options_.max_num_consecutive_invalid_steps;
-  options_.num_threads = 50;
+  options_.num_threads = node->declare_parameter("ceres_num_threads", 8);
   options_.use_nonmonotonic_steps = true;
   options_.jacobi_scaling = true;
 
@@ -164,6 +178,15 @@ CeresSolver::~CeresSolver()
   }
   if (blocks_ != NULL) {
     delete blocks_;
+  }
+  if (sensor_offsets_ != NULL) {
+    delete sensor_offsets_;
+  }
+  if (sensor_offsets_initialized_ != NULL) {
+    delete sensor_offsets_initialized_;
+  }
+  if (sensor_offset_covariances_ != NULL) {
+    delete sensor_offset_covariances_;
   }
   if (problem_ != NULL) {
     delete problem_;
@@ -223,6 +246,33 @@ void CeresSolver::Compute()
     pose.SetHeading(iter->second(2));
     corrections_.push_back(std::make_pair(iter->first, pose));
   }
+
+  // store the live sensor extrinsic estimate(s), and their marginal covariance for the RViz
+  // debug publisher -- both empty/unpopulated if extrinsic calibration is disabled.
+  sensor_offset_corrections_.clear();
+  if (optimize_sensor_extrinsics_) {
+    for (auto & kv : *sensor_offsets_) {
+      sensor_offset_corrections_[kv.first] =
+        karto::Pose2(kv.second(0), kv.second(1), kv.second(2));
+    }
+
+    ceres::Covariance::Options cov_options;
+    for (auto & kv : *sensor_offsets_) {
+      Eigen::Vector3d & ext = kv.second;
+      std::vector<const double *> blocks = {&ext(0), &ext(1), &ext(2)};
+      ceres::Covariance covariance(cov_options);
+      if (covariance.Compute(blocks, problem_)) {
+        Eigen::Matrix<double, 3, 3, Eigen::RowMajor> cov;
+        if (covariance.GetCovarianceMatrix(blocks, cov.data())) {
+          (*sensor_offset_covariances_)[kv.first] = cov;
+        }
+      } else {
+        RCLCPP_WARN(node_->get_logger(),
+          "CeresSolver: Failed to compute marginal covariance for sensor extrinsic '%s'.",
+          kv.first.c_str());
+      }
+    }
+  }
 }
 
 /*****************************************************************************/
@@ -262,8 +312,25 @@ void CeresSolver::Reset()
     delete blocks_;
   }
 
+  if (sensor_offsets_) {
+    delete sensor_offsets_;
+  }
+
+  if (sensor_offsets_initialized_) {
+    delete sensor_offsets_initialized_;
+  }
+
+  if (sensor_offset_covariances_) {
+    delete sensor_offset_covariances_;
+  }
+
   nodes_ = new std::unordered_map<int, Eigen::Vector3d>();
-  blocks_ = new std::unordered_map<std::size_t, ceres::ResidualBlockId>();
+  blocks_ = new std::unordered_map<std::size_t, std::vector<ceres::ResidualBlockId>>();
+  sensor_offsets_ = new std::unordered_map<std::string, Eigen::Vector3d>();
+  sensor_offsets_initialized_ = new std::unordered_set<std::string>();
+  sensor_offset_covariances_ = new std::unordered_map<std::string, Eigen::Matrix3d>();
+  sensor_offset_corrections_.clear();
+  sensor_nominal_offsets_.clear();
   problem_ = new ceres::Problem(options_problem_);
   first_node_ = nodes_->end();
 
@@ -293,6 +360,33 @@ void CeresSolver::AddNode(karto::Vertex<karto::LocalizedRangeScan> * pVertex)
 }
 
 /*****************************************************************************/
+void CeresSolver::GetOrCreateSensorOffset(
+  const std::string & sensorName, const karto::Pose2 & nominalOffset)
+/*****************************************************************************/
+{
+  // caller (AddConstraint) already holds nodes_mutex_
+  if (sensor_offsets_initialized_->count(sensorName)) {
+    return;
+  }
+
+  Eigen::Vector3d offset(nominalOffset.GetX(), nominalOffset.GetY(), nominalOffset.GetHeading());
+  (*sensor_offsets_)[sensorName] = offset;
+  Eigen::Vector3d & ref = (*sensor_offsets_)[sensorName];
+  sensor_nominal_offsets_[sensorName] = nominalOffset;
+
+  // AddResidualBlock is what implicitly creates the (x_e, y_e, yaw_e) parameter blocks in the
+  // Ceres problem -- SetParameterization must come after, not before, or Ceres doesn't know
+  // about the block yet.
+  ceres::CostFunction * prior = ExtrinsicPriorErrorTerm::Create(
+    ref(0), ref(1), ref(2), extrinsic_prior_stddev_xy_, extrinsic_prior_stddev_yaw_);
+  problem_->AddResidualBlock(prior, nullptr /* no robust loss on the prior */,
+    &ref(0), &ref(1), &ref(2));
+  problem_->SetParameterization(&ref(2), angle_local_parameterization_);
+
+  sensor_offsets_initialized_->insert(sensorName);
+}
+
+/*****************************************************************************/
 void CeresSolver::AddConstraint(karto::Edge<karto::LocalizedRangeScan> * pEdge)
 /*****************************************************************************/
 {
@@ -318,33 +412,99 @@ void CeresSolver::AddConstraint(karto::Edge<karto::LocalizedRangeScan> * pEdge)
 
   // extract transformation
   karto::LinkInfo * pLinkInfo = (karto::LinkInfo *)(pEdge->GetLabel());
-  karto::Pose2 diff = pLinkInfo->GetPoseDifference();
-  Eigen::Vector3d pose2d(diff.GetX(), diff.GetY(), diff.GetHeading());
 
-  karto::Matrix3 precisionMatrix = pLinkInfo->GetCovariance().Inverse();
-  Eigen::Matrix3d information;
-  information(0, 0) = precisionMatrix(0, 0);
-  information(0, 1) = information(1, 0) = precisionMatrix(0, 1);
-  information(0, 2) = information(2, 0) = precisionMatrix(0, 2);
-  information(1, 1) = precisionMatrix(1, 1);
-  information(1, 2) = information(2, 1) = precisionMatrix(1, 2);
-  information(2, 2) = precisionMatrix(2, 2);
-  Eigen::Matrix3d sqrt_information = information.llt().matrixU();
+  std::vector<ceres::ResidualBlockId> edge_blocks;
 
-  // populate residual and parameterization for heading normalization
-  ceres::CostFunction * cost_function = PoseGraph2dErrorTerm::Create(pose2d(0),
-      pose2d(1), pose2d(2), sqrt_information);
-  ceres::ResidualBlockId block = problem_->AddResidualBlock(
-    cost_function, loss_function_,
-    &node1it->second(0), &node1it->second(1), &node1it->second(2),
-    &node2it->second(0), &node2it->second(1), &node2it->second(2));
-  problem_->SetParameterization(&node1it->second(2),
-    angle_local_parameterization_);
-  problem_->SetParameterization(&node2it->second(2),
-    angle_local_parameterization_);
+  if (optimize_sensor_extrinsics_ && pLinkInfo->HasSensorFrameData()) {
+    // joint lidar<->base_link extrinsic calibration path: the measurement was made in the
+    // sensor frame, and the extrinsic is a live parameter block shared by every edge from
+    // this sensor, anchored to its nominal (TF-derived) value by a Gaussian prior.
+    const std::string sensorName =
+      pEdge->GetSource()->GetObject()->GetSensorName().ToString();
+    const karto::Pose2 nominalOffset =
+      pEdge->GetSource()->GetObject()->GetLaserRangeFinder()->GetOffsetPose();
+    GetOrCreateSensorOffset(sensorName, nominalOffset);
+    Eigen::Vector3d & ext = (*sensor_offsets_)[sensorName];
 
-  blocks_->insert(std::pair<std::size_t, ceres::ResidualBlockId>(
-      GetHash(node1, node2), block));
+    karto::Pose2 sdiff = pLinkInfo->GetSensorPoseDifference();
+    Eigen::Vector3d spose2d(sdiff.GetX(), sdiff.GetY(), sdiff.GetHeading());
+
+    karto::Matrix3 sprecision = pLinkInfo->GetSensorCovariance().Inverse();
+    Eigen::Matrix3d sinformation;
+    sinformation(0, 0) = sprecision(0, 0);
+    sinformation(0, 1) = sinformation(1, 0) = sprecision(0, 1);
+    sinformation(0, 2) = sinformation(2, 0) = sprecision(0, 2);
+    sinformation(1, 1) = sprecision(1, 1);
+    sinformation(1, 2) = sinformation(2, 1) = sprecision(1, 2);
+    sinformation(2, 2) = sprecision(2, 2);
+    Eigen::Matrix3d ssqrt_information = sinformation.llt().matrixU();
+
+    ceres::CostFunction * cost_function = SensorExtrinsicPoseGraph2dErrorTerm::Create(
+      spose2d(0), spose2d(1), spose2d(2), ssqrt_information);
+    edge_blocks.push_back(problem_->AddResidualBlock(
+      cost_function, loss_function_,
+      &node1it->second(0), &node1it->second(1), &node1it->second(2),
+      &node2it->second(0), &node2it->second(1), &node2it->second(2),
+      &ext(0), &ext(1), &ext(2)));
+    problem_->SetParameterization(&node1it->second(2),
+      angle_local_parameterization_);
+    problem_->SetParameterization(&node2it->second(2),
+      angle_local_parameterization_);
+
+    if (pLinkInfo->HasOdomFrameData()) {
+      // Independent robot-frame measurement (fused wheel+IMU odometry, not scan matching).
+      // Without this, the extrinsic-aware residual above has an exact SE(2) conjugation
+      // symmetry in `ext` (for any ext there's a compensating set of node poses that zeroes
+      // every sensor-frame residual identically) -- this is the AX=XB structure that actually
+      // makes `ext` identifiable. See PLAN.md addendum for the full derivation.
+      karto::Pose2 odiff = pLinkInfo->GetOdomPoseDifference();
+      Eigen::Vector3d opose2d(odiff.GetX(), odiff.GetY(), odiff.GetHeading());
+
+      Eigen::Matrix3d odom_sqrt_information = Eigen::Matrix3d::Zero();
+      odom_sqrt_information(0, 0) = 1.0 / odometry_edge_stddev_xy_;
+      odom_sqrt_information(1, 1) = 1.0 / odometry_edge_stddev_xy_;
+      odom_sqrt_information(2, 2) = 1.0 / odometry_edge_stddev_yaw_;
+
+      ceres::CostFunction * odom_cost_function = PoseGraph2dErrorTerm::Create(
+        opose2d(0), opose2d(1), opose2d(2), odom_sqrt_information);
+      edge_blocks.push_back(problem_->AddResidualBlock(
+        odom_cost_function, loss_function_,
+        &node1it->second(0), &node1it->second(1), &node1it->second(2),
+        &node2it->second(0), &node2it->second(1), &node2it->second(2)));
+      // node1/node2 yaw parameterization already set above for this same edge.
+    }
+  } else {
+    // legacy path: robot-frame measurement, no extrinsic parameter (used whenever extrinsic
+    // calibration is disabled, and as a fallback for edges loaded from a pose graph serialized
+    // before this feature existed, which have no sensor-frame data).
+    karto::Pose2 diff = pLinkInfo->GetPoseDifference();
+    Eigen::Vector3d pose2d(diff.GetX(), diff.GetY(), diff.GetHeading());
+
+    karto::Matrix3 precisionMatrix = pLinkInfo->GetCovariance().Inverse();
+    Eigen::Matrix3d information;
+    information(0, 0) = precisionMatrix(0, 0);
+    information(0, 1) = information(1, 0) = precisionMatrix(0, 1);
+    information(0, 2) = information(2, 0) = precisionMatrix(0, 2);
+    information(1, 1) = precisionMatrix(1, 1);
+    information(1, 2) = information(2, 1) = precisionMatrix(1, 2);
+    information(2, 2) = precisionMatrix(2, 2);
+    Eigen::Matrix3d sqrt_information = information.llt().matrixU();
+
+    // populate residual and parameterization for heading normalization
+    ceres::CostFunction * cost_function = PoseGraph2dErrorTerm::Create(pose2d(0),
+        pose2d(1), pose2d(2), sqrt_information);
+    edge_blocks.push_back(problem_->AddResidualBlock(
+      cost_function, loss_function_,
+      &node1it->second(0), &node1it->second(1), &node1it->second(2),
+      &node2it->second(0), &node2it->second(1), &node2it->second(2)));
+    problem_->SetParameterization(&node1it->second(2),
+      angle_local_parameterization_);
+    problem_->SetParameterization(&node2it->second(2),
+      angle_local_parameterization_);
+  }
+
+  blocks_->insert(std::pair<std::size_t, std::vector<ceres::ResidualBlockId>>(
+      GetHash(node1, node2), edge_blocks));
 }
 
 /*****************************************************************************/
@@ -384,15 +544,19 @@ void CeresSolver::RemoveConstraint(kt_int32s sourceId, kt_int32s targetId)
 /*****************************************************************************/
 {
   boost::mutex::scoped_lock lock(nodes_mutex_);
-  std::unordered_map<std::size_t, ceres::ResidualBlockId>::iterator it_a =
+  std::unordered_map<std::size_t, std::vector<ceres::ResidualBlockId>>::iterator it_a =
     blocks_->find(GetHash(sourceId, targetId));
-  std::unordered_map<std::size_t, ceres::ResidualBlockId>::iterator it_b =
+  std::unordered_map<std::size_t, std::vector<ceres::ResidualBlockId>>::iterator it_b =
     blocks_->find(GetHash(targetId, sourceId));
   if (it_a != blocks_->end()) {
-    problem_->RemoveResidualBlock(it_a->second);
+    for (const auto & block : it_a->second) {
+      problem_->RemoveResidualBlock(block);
+    }
     blocks_->erase(it_a);
   } else if (it_b != blocks_->end()) {
-    problem_->RemoveResidualBlock(it_b->second);
+    for (const auto & block : it_b->second) {
+      problem_->RemoveResidualBlock(block);
+    }
     blocks_->erase(it_b);
   } else {
     RCLCPP_ERROR(node_->get_logger(),
@@ -431,6 +595,30 @@ std::unordered_map<int, Eigen::Vector3d> * CeresSolver::getGraph()
 {
   boost::mutex::scoped_lock lock(nodes_mutex_);
   return nodes_;
+}
+
+/*****************************************************************************/
+const std::unordered_map<std::string, karto::Pose2> &
+CeresSolver::GetSensorOffsetCorrections() const
+/*****************************************************************************/
+{
+  return sensor_offset_corrections_;
+}
+
+/*****************************************************************************/
+const std::unordered_map<std::string, Eigen::Matrix3d> &
+CeresSolver::GetSensorOffsetCovariances() const
+/*****************************************************************************/
+{
+  return *sensor_offset_covariances_;
+}
+
+/*****************************************************************************/
+const std::unordered_map<std::string, karto::Pose2> &
+CeresSolver::GetSensorNominalOffsets() const
+/*****************************************************************************/
+{
+  return sensor_nominal_offsets_;
 }
 
 }  // namespace solver_plugins

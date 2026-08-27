@@ -18,6 +18,7 @@
 
 #include <unordered_map>
 #include <memory>
+#include <cmath>
 
 #include "slam_toolbox/loop_closure_assistant.hpp"
 
@@ -29,10 +30,10 @@ LoopClosureAssistant::LoopClosureAssistant(
   rclcpp::Node::SharedPtr node,
   karto::Mapper * mapper,
   laser_utils::ScanHolder * scan_holder,
-  PausedState & state, ProcessType & processor_type)
+  PausedState & state, ProcessType & processor_type, tf2_ros::Buffer * tf)
 : mapper_(mapper), scan_holder_(scan_holder),
   interactive_mode_(false), node_(node), state_(state),
-  processor_type_(processor_type)
+  processor_type_(processor_type), tf_(tf)
 /*****************************************************************************/
 {
   node_->declare_parameter("paused_processing", false);
@@ -69,6 +70,34 @@ LoopClosureAssistant::LoopClosureAssistant(
   marker_publisher_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
     "slam_toolbox/graph_visualization", rclcpp::QoS(1));
   map_frame_ = node->get_parameter("map_frame").as_string();
+  base_frame_ = node->get_parameter("base_frame").as_string();
+
+  // Debug visualization of the live, jointly-optimized sensor extrinsic estimate (see
+  // PLAN.md step 10). Empty/unpublished unless optimize_sensor_extrinsics is enabled -
+  // solver_->GetSensorOffsetCorrections() returns an empty map otherwise.
+  extrinsic_pub_ = node_->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "slam_toolbox/sensor_extrinsic_calibration", rclcpp::QoS(1));
+
+  // Frame to publish the extrinsic debug pose in. Left unset, falls back to base_frame_ (the
+  // original behavior). Set to the lidar's own TF frame (e.g. "lidar_link") to instead publish
+  // the residual between the live estimate and its frozen nominal, landing the marker where a
+  // deliberately-offset link (e.g. a Gazebo test rig's lidar_offset_link) would be -- directly
+  // comparable in RViz.
+  node_->declare_parameter("lidar_frame", std::string(""));
+  lidar_frame_ = node_->get_parameter("lidar_frame").as_string();
+  if (lidar_frame_.empty()) {
+    lidar_frame_ = base_frame_;
+  }
+
+  // Republish the last computed extrinsic estimate at a fixed, faster rate than publishGraph()
+  // runs at (map_update_interval / loop closures / periodic solve), purely so RViz's
+  // PoseWithCovariance display keeps redrawing smoothly between real updates. No-op when
+  // nothing has been computed yet (e.g. extrinsic calibration disabled).
+  node_->declare_parameter("extrinsic_publish_rate", 10.0);
+  const double extrinsic_publish_rate = node_->get_parameter("extrinsic_publish_rate").as_double();
+  extrinsic_publish_timer_ = node_->create_wall_timer(
+    std::chrono::duration<double>(1.0 / extrinsic_publish_rate),
+    std::bind(&LoopClosureAssistant::publishExtrinsicCalibration, this));
 }
 
 /*****************************************************************************/
@@ -262,6 +291,108 @@ void LoopClosureAssistant::publishGraph()
   // if disabled, clears out old markers
   interactive_server_->applyChanges();
   marker_publisher_->publish(marray);
+
+  // compute/cache the live sensor extrinsic (lidar<->base_link) calibration estimate, if any -
+  // empty/no-op unless optimize_sensor_extrinsics is enabled and at least one solve has
+  // completed. Published relative to its frozen nominal, in lidar_frame_, so it's directly
+  // comparable to e.g. a test rig's deliberately-offset lidar link in RViz.
+  const auto & offset_corrections = solver_->GetSensorOffsetCorrections();
+  const auto & offset_covariances = solver_->GetSensorOffsetCovariances();
+  const auto & nominal_offsets = solver_->GetSensorNominalOffsets();
+  for (const auto & sensorCorrection : offset_corrections) {
+    const karto::Pose2 & estimate = sensorCorrection.second;
+
+    // residual = nominal^-1 . estimate, i.e. "estimate expressed in the nominal frame" -- same
+    // Transform-based composition LinkInfo::Update/UpdateSensorFrame already use.
+    karto::Pose2 nominal;
+    const auto nominal_it = nominal_offsets.find(sensorCorrection.first);
+    if (nominal_it != nominal_offsets.end()) {
+      nominal = nominal_it->second;
+    }
+    karto::Transform toNominalFrame(nominal, karto::Pose2());
+    const karto::Pose2 residual = toNominalFrame.TransformPose(estimate);
+
+    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
+    pose_msg.header.frame_id = lidar_frame_;
+    pose_msg.header.stamp = node_->now();
+
+    // lidar_frame_ may be mounted upside-down relative to base_frame_ (Z axis flipped in
+    // world space). karto/Ceres only ever reasons in 2D, so every yaw value it produces is
+    // implicitly "measured about base_frame_'s own upright Z axis" -- publishing that same
+    // value as a rotation about a Z-flipped child frame's own axis silently negates its visual
+    // sense (R.Rz(th).R^-1 = Rz(-th) whenever R maps Z -> -Z). Correct for it here.
+    double published_heading = residual.GetHeading();
+    if (isLidarFrameInverted()) {
+      published_heading = -published_heading;
+    }
+
+    tf2::Quaternion q(0., 0., 0., 1.0);
+    q.setRPY(0., 0., published_heading);
+    tf2::Transform transform(q, tf2::Vector3(residual.GetX(), residual.GetY(), 0.0));
+    tf2::toMsg(transform, pose_msg.pose.pose);
+
+    const auto cov_it = offset_covariances.find(sensorCorrection.first);
+    if (cov_it != offset_covariances.end()) {
+      // rotate the covariance into the same (nominal) frame the position was just expressed in
+      Eigen::Matrix3d rot = Eigen::Matrix3d::Identity();
+      const double c = std::cos(-nominal.GetHeading());
+      const double s = std::sin(-nominal.GetHeading());
+      rot(0, 0) = c; rot(0, 1) = -s;
+      rot(1, 0) = s; rot(1, 1) = c;
+      const Eigen::Matrix3d cov = rot * cov_it->second * rot.transpose();
+      pose_msg.pose.covariance[0] = cov(0, 0);   // x
+      pose_msg.pose.covariance[1] = cov(0, 1);   // xy
+      pose_msg.pose.covariance[6] = cov(1, 0);   // xy
+      pose_msg.pose.covariance[7] = cov(1, 1);   // y
+      pose_msg.pose.covariance[35] = cov(2, 2);  // yaw
+    }
+
+    boost::mutex::scoped_lock lock(extrinsic_mutex_);
+    last_extrinsic_msgs_[sensorCorrection.first] = pose_msg;
+  }
+
+  publishExtrinsicCalibration();
+}
+
+/*****************************************************************************/
+void LoopClosureAssistant::publishExtrinsicCalibration()
+/*****************************************************************************/
+{
+  boost::mutex::scoped_lock lock(extrinsic_mutex_);
+  const rclcpp::Time now = node_->now();
+  for (auto & kv : last_extrinsic_msgs_) {
+    kv.second.header.stamp = now;
+    extrinsic_pub_->publish(kv.second);
+  }
+}
+
+/*****************************************************************************/
+bool LoopClosureAssistant::isLidarFrameInverted()
+/*****************************************************************************/
+{
+  if (lidar_frame_inversion_checked_) {
+    return lidar_frame_inverted_;
+  }
+
+  // Same technique laser_utils::LaserAssistant::isInverted() uses: rotate the "up" vector from
+  // base_frame_ into lidar_frame_ and see if it comes out pointing down. A no-op (never
+  // inverted) when lidar_frame_ == base_frame_, e.g. the lidar_frame param was left unset.
+  geometry_msgs::msg::Vector3Stamped up_in_base;
+  up_in_base.header.frame_id = base_frame_;
+  up_in_base.vector.x = 0.0;
+  up_in_base.vector.y = 0.0;
+  up_in_base.vector.z = 1.0;
+
+  try {
+    geometry_msgs::msg::Vector3Stamped up_in_lidar = tf_->transform(up_in_base, lidar_frame_);
+    lidar_frame_inverted_ = (up_in_lidar.vector.z <= 0.0);
+    lidar_frame_inversion_checked_ = true;
+  } catch (const tf2::TransformException & e) {
+    RCLCPP_DEBUG(node_->get_logger(),
+      "isLidarFrameInverted: TF not yet available (%s), will retry.", e.what());
+  }
+
+  return lidar_frame_inverted_;
 }
 
 /*****************************************************************************/

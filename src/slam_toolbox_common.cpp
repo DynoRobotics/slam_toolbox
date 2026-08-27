@@ -69,7 +69,7 @@ void SlamToolbox::configure()
   closure_assistant_ =
     std::make_unique<loop_closure_assistant::LoopClosureAssistant>(
     shared_from_this(), smapper_->getMapper(), scan_holder_.get(),
-    state_, processor_type_);
+    state_, processor_type_, tf_.get());
   reprocessing_transform_.setIdentity();
 
   double transform_publish_period = 0.05;
@@ -714,6 +714,31 @@ void SlamToolbox::loadSerializedPoseGraph(
 
   solver_->Reset();
 
+  if (dataset->GetLasers().size() < 1) {
+    RCLCPP_FATAL(get_logger(), "loadSerializedPoseGraph: Cannot deserialize "
+      "dataset with no laser objects.");
+    exit(-1);
+  }
+
+  // Register the deserialized laser sensor with the SensorManager singleton *before* replaying
+  // nodes/constraints below: if extrinsic calibration is enabled, AddConstraint looks up each
+  // edge's sensor by name (to seed/anchor the live extrinsic parameter block), and that lookup
+  // throws if the sensor isn't registered yet. The prior is anchored to whatever offset was
+  // last saved with this map (not re-queried from TF), so it starts from the best available
+  // estimate rather than the original CAD/mounting nominal -- see loadSerializedPoseGraph's
+  // header comment in PLAN.md step 8 for why this is an accepted, documented trade-off.
+  LaserRangeFinder * laser =
+    dynamic_cast<LaserRangeFinder *>(
+    dataset->GetLasers()[0]);
+  Sensor * pSensor = dynamic_cast<Sensor *>(laser);
+  if (pSensor) {
+    SensorManager::GetInstance()->RegisterSensor(pSensor);
+    lasers_.clear();
+  } else {
+    RCLCPP_ERROR(get_logger(), "Invalid sensor pointer in dataset."
+      " Unable to register sensor.");
+  }
+
   // add the nodes and constraints to the optimizer
   VerticeMap mapper_vertices = mapper->GetGraph()->GetVertices();
   VerticeMap::iterator vertex_map_it = mapper_vertices.begin();
@@ -748,25 +773,6 @@ void SlamToolbox::loadSerializedPoseGraph(
       "loadSerializedPoseGraph: Could not properly load "
       "a valid mapping object. Did you modify something by hand?");
     exit(-1);
-  }
-
-  if (dataset_->GetLasers().size() < 1) {
-    RCLCPP_FATAL(get_logger(), "loadSerializedPoseGraph: Cannot deserialize "
-      "dataset with no laser objects.");
-    exit(-1);
-  }
-
-  // create a current laser sensor
-  LaserRangeFinder * laser =
-    dynamic_cast<LaserRangeFinder *>(
-    dataset_->GetLasers()[0]);
-  Sensor * pSensor = dynamic_cast<Sensor *>(laser);
-  if (pSensor) {
-    SensorManager::GetInstance()->RegisterSensor(pSensor);
-    lasers_.clear();
-  } else {
-    RCLCPP_ERROR(get_logger(), "Invalid sensor pointer in dataset."
-      " Unable to register sensor.");
   }
 
   solver_->Compute();
