@@ -1657,7 +1657,22 @@ void MapperGraph::LinkScans(
     // and the independent odometry-frame measurement (fused wheel+IMU odometry via TF, not
     // scan matching) -- this is what makes the extrinsic actually identifiable; see
     // UpdateOdometryFrame's doc comment and the PLAN.md addendum.
-    pLinkInfo->UpdateOdometryFrame(pFromScan->GetOdometricPose(), pToScan->GetOdometricPose());
+    //
+    // Sequential edges only. odometry_edge_stddev_{xy,yaw} is a single fixed per-edge noise
+    // model, and it can only be sized for one kind of span: consecutive nodes, which are
+    // bounded apart by minimum_travel_distance/minimum_travel_heading/minimum_time_interval.
+    // Near-chain and loop-closure edges join scans separated by an arbitrarily long driven
+    // path, over which dead reckoning has drifted by far more than that stddev -- applying it
+    // there is wildly overconfident, makes stale odometry fight the loop closure, and biases
+    // the extrinsic. Sizing the stddev for those long edges instead (the previous approach)
+    // just throws away the sequential edges' information, which is where the calibration
+    // signal actually is.
+    const kt_int32s stateIdDelta = pToScan->GetStateId() - pFromScan->GetStateId();
+    if (pFromScan->GetSensorName() == pToScan->GetSensorName() &&
+      (stateIdDelta == 1 || stateIdDelta == -1))
+    {
+      pLinkInfo->UpdateOdometryFrame(pFromScan->GetOdometricPose(), pToScan->GetOdometricPose());
+    }
     pEdge->SetLabel(pLinkInfo);
     if (m_pMapper->m_pScanOptimizer != NULL) {
       m_pMapper->m_pScanOptimizer->AddConstraint(pEdge);
