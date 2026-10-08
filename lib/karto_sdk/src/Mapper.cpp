@@ -35,6 +35,8 @@
 
 #include "karto_sdk/Mapper.h"
 
+#include "Eigen/Eigenvalues"
+
 // Must live at global scope (not inside `namespace karto`): BOOST_CLASS_VERSION expands to
 // `namespace boost { namespace serialization { ... } }`, and nesting that inside `namespace
 // karto` would define a bogus karto::boost::serialization instead of ::boost::serialization,
@@ -481,6 +483,9 @@ ScanMatcher::~ScanMatcher()
   if (m_pGridLookup) {
     delete m_pGridLookup;
   }
+  if (m_pReflectorGrid) {
+    delete m_pReflectorGrid;
+  }
 }
 
 ScanMatcher * ScanMatcher::Create(
@@ -579,8 +584,26 @@ kt_double ScanMatcher::MatchScan(
 
   ///////////////////////////////////////
 
+  // Reflector-only mode leaves a matcher without reflectors (the loop matcher) nothing to
+  // match on: report no match, so loop closure is skipped (REFLECTOR_SLAM.md §5.6).
+  m_UseGeometry = m_pMapper->m_pUseGeometry->GetValue() ||
+    !m_pMapper->m_pUseReflectors->GetValue();
+  PrepareReflectors(pScan);
+  if (m_pReflectorGrid) {
+    m_pReflectorGrid->GetCoordinateConverter()->SetOffset(offset);
+  }
+  if (!m_UseGeometry && !ReflectorsAllowed()) {
+    rMean = scanPose;
+    rCovariance.SetToIdentity();
+    rCovariance(0, 0) = MAX_VARIANCE;
+    rCovariance(1, 1) = MAX_VARIANCE;
+    rCovariance(2, 2) = 4 * math::Square(m_pMapper->m_pCoarseAngleResolution->GetValue());
+    return 0.0;
+  }
+
   // set up correlation grid
   AddScans(rBaseScans, scanPose.GetPosition());
+  m_ReflectorsActive = m_ReflectorsWanted && m_ReferenceReflectorCount > 0;
 
   // compute how far to search in each direction
   Vector2<kt_double> searchDimensions(m_pSearchSpaceProbs->GetWidth(),
@@ -593,6 +616,37 @@ kt_double ScanMatcher::MatchScan(
   Vector2<kt_double> coarseSearchResolution(2 * m_pCorrelationGrid->GetResolution(),
     2 * m_pCorrelationGrid->GetResolution());
 
+  // The online sequential match (Process): diagnostics and, with OdometryPriorFusion, the
+  // odometry prior (REFLECTOR_SLAM.md 5.10). The prior needs the full 3x3 covariance of the
+  // geometry surface, so it always goes through the information path.
+  const kt_bool sequentialOnline = doPenalize && this == m_pMapper->m_pSequentialScanMatcher;
+  const kt_bool odometryPrior = sequentialOnline &&
+    m_pMapper->m_pOdometryPriorFusion->GetValue();
+  if (sequentialOnline) {
+    m_LastMatch = MatchDiagnostics();
+  }
+  if (m_UseGeometry && ((m_ReflectorsActive &&
+    m_pMapper->m_pReflectorInformationFusion->GetValue()) || odometryPrior))
+  {
+    const kt_double response = MatchInformation(pScan, scanPose, coarseSearchOffset,
+        coarseSearchResolution, doPenalize, doRefineMatch, rMean, rCovariance);
+    if (response >= 0.0) {
+      if (sequentialOnline) {
+        FinishSequentialMatch(pScan, scanPose, rMean, rCovariance);
+      }
+      return response;
+    }
+  }
+
+  // L1 (REFLECTOR_SLAM.md §5.9): the loop matcher's coarse covariance from the relative-window
+  // 3x3 moments, so a ridge along a featureless corridor reports its full length and fails
+  // loop_match_maximum_variance_coarse.
+  const MapperGraph * pGraph = m_pMapper->GetGraph();
+  const kt_bool relativeCovariance = !doRefineMatch && pGraph != nullptr &&
+    this == pGraph->GetLoopScanMatcher() &&
+    m_pMapper->m_pLoopMatchRelativeCovariance->GetValue();
+  m_ComputeFullCovariance = relativeCovariance;
+
   // actual scan-matching
   kt_double bestResponse = CorrelateScan(pScan, scanPose, coarseSearchOffset,
       coarseSearchResolution,
@@ -600,7 +654,8 @@ kt_double ScanMatcher::MatchScan(
       m_pMapper->m_pCoarseAngleResolution->GetValue(),
       doPenalize, rMean, rCovariance, false);
 
-  if (m_pMapper->m_pUseResponseExpansion->GetValue() == true) {
+  // Without geometry, response 0 just means no reflector in view: widening cannot help.
+  if (m_pMapper->m_pUseResponseExpansion->GetValue() == true && m_UseGeometry) {
     if (math::DoubleEqual(bestResponse, 0.0)) {
 #ifdef KARTO_DEBUG
       std::cout << "Mapper Info: Expanding response search space!" << std::endl;
@@ -627,6 +682,13 @@ kt_double ScanMatcher::MatchScan(
     }
   }
 
+  if (relativeCovariance) {
+    m_ComputeFullCovariance = false;
+    if (bestResponse > KT_TOLERANCE) {
+      rCovariance = m_FullCovariance;
+    }
+  }
+
   if (doRefineMatch) {
     Vector2<kt_double> fineSearchOffset(coarseSearchResolution * 0.5);
     Vector2<kt_double> fineSearchResolution(m_pCorrelationGrid->GetResolution(),
@@ -637,6 +699,26 @@ kt_double ScanMatcher::MatchScan(
         doPenalize, rMean, rCovariance, true);
   }
 
+  // One reflector fixes position but not heading: the score is a ridge of poses rotating about
+  // it. The odometry penalty picks the right one, but the angular variance, taken at a fixed
+  // cell, comes out small. Without geometry and with fewer than two matched reflectors, fall
+  // back to the variance used for response 0 (REFLECTOR_SLAM.md §5.6).
+  const kt_int32u matchedReflectors = CountMatchedReflectors(pScan, rMean);
+  if (!m_UseGeometry && matchedReflectors < 2) {
+    rCovariance(2, 2) = math::Maximum(rCovariance(2, 2),
+        4 * math::Square(m_pMapper->m_pCoarseAngleResolution->GetValue()));
+  }
+  if (doPenalize) {
+    m_LastReflectorStats.fused = false;
+    m_LastReflectorStats.gated = false;
+    m_LastReflectorStats.gateD2 = 0.0;
+    m_LastReflectorStats.active = m_ReflectorsActive;
+    m_LastReflectorStats.scanPoints = static_cast<kt_int32u>(pScan->GetReflectorPoints().size());
+    m_LastReflectorStats.referencePoints = m_ReferenceReflectorCount;
+    m_LastReflectorStats.matched = matchedReflectors;
+    m_LastReflectorStats.response = bestResponse;
+  }
+
 #ifdef KARTO_DEBUG
   std::cout << "  BEST POSE = " << rMean << " BEST RESPONSE = " << bestResponse <<
     ",  VARIANCE = " <<
@@ -644,7 +726,23 @@ kt_double ScanMatcher::MatchScan(
 #endif
   assert(math::InRange(rMean.GetHeading(), -KT_PI, KT_PI));
 
+  if (sequentialOnline) {
+    FinishSequentialMatch(pScan, scanPose, rMean, rCovariance);
+  }
   return bestResponse;
+}
+
+kt_double ScanMatcher::Penalty(kt_double squaredDistance, kt_double angleOffset) const
+{
+  kt_double distancePenalty = 1.0 - (DISTANCE_PENALTY_GAIN *
+    squaredDistance / m_pMapper->m_pDistanceVariancePenalty->GetValue());
+  distancePenalty = math::Maximum(distancePenalty,
+      m_pMapper->m_pMinimumDistancePenalty->GetValue());
+
+  kt_double anglePenalty = 1.0 - (ANGLE_PENALTY_GAIN *
+    math::Square(angleOffset) / m_pMapper->m_pAngleVariancePenalty->GetValue());
+  anglePenalty = math::Maximum(anglePenalty, m_pMapper->m_pMinimumAnglePenalty->GetValue());
+  return distancePenalty * anglePenalty;
 }
 
 void ScanMatcher::operator()(const kt_double & y) const
@@ -670,31 +768,26 @@ void ScanMatcher::operator()(const kt_double & y) const
       m_pCorrelationGrid->WorldToGrid(Vector2<kt_double>(newPositionX, newPositionY));
     kt_int32s gridIndex = m_pCorrelationGrid->GridIndex(gridPoint);
     assert(gridIndex >= 0);
+    const kt_int32s reflectorGridIndex =
+      ReflectorGridIndex(Vector2<kt_double>(newPositionX, newPositionY));
 
     kt_double angle = 0.0;
     kt_double startAngle = m_rSearchCenter.GetHeading() - m_searchAngleOffset;
     for (kt_int32u angleIndex = 0; angleIndex < m_nAngles; angleIndex++) {
       angle = startAngle + angleIndex * m_searchAngleResolution;
 
-      kt_double response = GetResponse(angleIndex, gridIndex);
+      kt_double accept = 0.0;
+      kt_double response = GetScore(angleIndex, gridIndex, reflectorGridIndex, accept);
       if (m_doPenalize && (math::DoubleEqual(response, 0.0) == false)) {
         // simple model (approximate Gaussian) to take odometry into account
-        kt_double squaredDistance = squareX + squareY;
-        kt_double distancePenalty = 1.0 - (DISTANCE_PENALTY_GAIN *
-          squaredDistance / m_pMapper->m_pDistanceVariancePenalty->GetValue());
-        distancePenalty = math::Maximum(distancePenalty,
-            m_pMapper->m_pMinimumDistancePenalty->GetValue());
-
-        kt_double squaredAngleDistance = math::Square(angle - m_rSearchCenter.GetHeading());
-        kt_double anglePenalty = 1.0 - (ANGLE_PENALTY_GAIN *
-          squaredAngleDistance / m_pMapper->m_pAngleVariancePenalty->GetValue());
-        anglePenalty = math::Maximum(anglePenalty, m_pMapper->m_pMinimumAnglePenalty->GetValue());
-
-        response *= (distancePenalty * anglePenalty);
+        const kt_double penalty = Penalty(squareX + squareY, angle - m_rSearchCenter.GetHeading());
+        response *= penalty;
+        accept *= penalty;
       }
 
       // store response and pose
       poseResponseCounter = (y_pose * size_x + x_pose) * (m_nAngles) + angleIndex;
+      m_pAcceptResponse[poseResponseCounter] = accept;
       m_pPoseResponse[poseResponseCounter] =
         std::pair<kt_double, Pose2>(response, Pose2(newPositionX, newPositionY,
           math::NormalizeAngle(angle)));
@@ -730,6 +823,10 @@ kt_double ScanMatcher::CorrelateScan(
   // setup lookup arrays
   m_pGridLookup->ComputeOffsets(pScan,
     rSearchCenter.GetHeading(), searchAngleOffset, searchAngleResolution);
+  if (m_ReflectorsActive) {
+    ComputeReflectorOffsets(pScan,
+      rSearchCenter.GetHeading(), searchAngleOffset, searchAngleResolution);
+  }
 
   // only initialize probability grid if computing positional covariance (during coarse match)
   if (!doingFineMatch) {
@@ -768,6 +865,7 @@ kt_double ScanMatcher::CorrelateScan(
 
   // allocate array
   m_pPoseResponse = new std::pair<kt_double, Pose2>[poseResponseSize];
+  m_pAcceptResponse = new kt_double[poseResponseSize];
 
   Vector2<kt_int32s> startGridPoint =
     m_pCorrelationGrid->WorldToGrid(Vector2<kt_double>(rSearchCenter.GetX() +
@@ -808,13 +906,33 @@ kt_double ScanMatcher::CorrelateScan(
     }
   }
 
+  // Diagnostics (REFLECTOR_SLAM.md 5.10, S0): every candidate with its penalized and raw response.
+  if (m_pSurfaceDump != nullptr) {
+    std::ostream & out = *m_pSurfaceDump;
+    for (kt_int32u i = 0; i < poseResponseSize; i++) {
+      const Pose2 & p = m_pPoseResponse[i].second;
+      const kt_double response = m_pPoseResponse[i].first;
+      const kt_double penalty = m_doPenalize ? Penalty(
+        math::Square(p.GetX() - rSearchCenter.GetX()) + math::Square(p.GetY() - rSearchCenter.GetY()),
+        math::NormalizeAngle(p.GetHeading() - rSearchCenter.GetHeading())) : 1.0;
+      out << pScan->GetTime() << ' ' << (doingFineMatch ? 1 : 0) << ' ' <<
+        static_cast<int>(m_ScoreSource) << ' ' << rSearchCenter.GetX() << ' ' <<
+        rSearchCenter.GetY() << ' ' << rSearchCenter.GetHeading() << ' ' << p.GetX() << ' ' <<
+        p.GetY() << ' ' << p.GetHeading() << ' ' << response << ' ' <<
+        (response != 0.0 ? response / penalty : 0.0) << '\n';
+    }
+  }
+
   // average all poses with same highest response
   Vector2<kt_double> averagePosition;
   kt_double thetaX = 0.0;
   kt_double thetaY = 0.0;
   kt_int32s averagePoseCount = 0;
+  // Acceptance response of the best poses; equal to bestResponse while reflectors are inactive.
+  kt_double bestAccept = 0.0;
   for (kt_int32u i = 0; i < poseResponseSize; i++) {
     if (math::DoubleEqual(m_pPoseResponse[i].first, bestResponse)) {
+      bestAccept = math::Maximum(bestAccept, m_pAcceptResponse[i]);
       averagePosition += m_pPoseResponse[i].second.GetPosition();
 
       kt_double heading = m_pPoseResponse[i].second.GetHeading();
@@ -837,9 +955,56 @@ kt_double ScanMatcher::CorrelateScan(
     throw std::runtime_error("Mapper FATAL ERROR - Unable to find best position");
   }
 
+  // Full 3x3 covariance over the whole coarse search (REFLECTOR_SLAM.md §5.5): weighted second
+  // moments of the poses scoring at least rho times the best, so it no longer depends on how the
+  // scores are scaled. Floors keep it invertible: half a search step in position and angle.
+  if (m_ComputeFullCovariance && !doingFineMatch) {
+    m_FullCovariance.SetToIdentity();
+    const kt_double rho = m_pMapper->m_pReflectorCovarianceWindow->GetValue();
+    kt_double sum = 0.0;
+    kt_double moments[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+    if (bestResponse > KT_TOLERANCE) {
+      for (kt_int32u i = 0; i < poseResponseSize; i++) {
+        const kt_double response = m_pPoseResponse[i].first;
+        if (response < rho * bestResponse) {
+          continue;
+        }
+        const Pose2 & rPose = m_pPoseResponse[i].second;
+        const kt_double d[3] = {rPose.GetX() - averagePose.GetX(),
+          rPose.GetY() - averagePose.GetY(),
+          math::NormalizeAngle(rPose.GetHeading() - averagePose.GetHeading())};
+        for (int r = 0; r < 3; r++) {
+          for (int c = 0; c < 3; c++) {
+            moments[r][c] += response * d[r] * d[c];
+          }
+        }
+        sum += response;
+      }
+    }
+    if (sum > KT_TOLERANCE) {
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+          m_FullCovariance(r, c) = moments[r][c] / sum;
+        }
+      }
+    } else {
+      m_FullCovariance(0, 0) = MAX_VARIANCE;
+      m_FullCovariance(1, 1) = MAX_VARIANCE;
+      m_FullCovariance(2, 2) = math::Square(searchAngleOffset);
+    }
+    m_FullCovariance(0, 0) = math::Maximum(m_FullCovariance(0, 0),
+        0.25 * math::Square(rSearchSpaceResolution.GetX()));
+    m_FullCovariance(1, 1) = math::Maximum(m_FullCovariance(1, 1),
+        0.25 * math::Square(rSearchSpaceResolution.GetY()));
+    m_FullCovariance(2, 2) = math::Maximum(m_FullCovariance(2, 2),
+        0.25 * math::Square(searchAngleResolution));
+  }
+
   // delete pose response array
   delete[] m_pPoseResponse;
   m_pPoseResponse = nullptr;
+  delete[] m_pAcceptResponse;
+  m_pAcceptResponse = nullptr;
 
 #ifdef KARTO_DEBUG
   std::cout << "bestPose: " << averagePose << std::endl;
@@ -867,7 +1032,12 @@ kt_double ScanMatcher::CorrelateScan(
   assert(math::InRange(bestResponse, 0.0, 1.0));
   assert(math::InRange(rMean.GetHeading(), -KT_PI, KT_PI));
 
-  return bestResponse;
+  // Accept on R_geom (R_refl without geometry), so reflectors cannot rescue a poor geometric
+  // match; pose and covariance come from the combined score above.
+  if (!m_ReflectorsActive) {
+    return bestResponse;
+  }
+  return math::Minimum(bestAccept, 1.0);
 }
 
 /**
@@ -999,6 +1169,7 @@ void ScanMatcher::ComputeAngularCovariance(
 
   Vector2<kt_int32s> gridPoint = m_pCorrelationGrid->WorldToGrid(rBestPose.GetPosition());
   kt_int32s gridIndex = m_pCorrelationGrid->GridIndex(gridPoint);
+  const kt_int32s reflectorGridIndex = ReflectorGridIndex(rBestPose.GetPosition());
 
   kt_int32u nAngles =
     static_cast<kt_int32u>(math::Round(searchAngleOffset * 2 / searchAngleResolution) + 1);
@@ -1010,7 +1181,8 @@ void ScanMatcher::ComputeAngularCovariance(
   kt_double accumulatedVarianceThTh = 0.0;
   for (kt_int32u angleIndex = 0; angleIndex < nAngles; angleIndex++) {
     angle = startAngle + angleIndex * searchAngleResolution;
-    kt_double response = GetResponse(angleIndex, gridIndex);
+    kt_double accept = 0.0;
+    kt_double response = GetScore(angleIndex, gridIndex, reflectorGridIndex, accept);
 
     // response is not a low response
     if (response >= (bestResponse - 0.1)) {
@@ -1041,6 +1213,7 @@ void ScanMatcher::ComputeAngularCovariance(
 void ScanMatcher::AddScans(const LocalizedRangeScanVector & rScans, Vector2<kt_double> viewPoint)
 {
   m_pCorrelationGrid->Clear();
+  m_ReferenceReflectorCount = 0;
 
   // add all scans to grid
   const_forEach(LocalizedRangeScanVector, &rScans)
@@ -1061,6 +1234,7 @@ void ScanMatcher::AddScans(const LocalizedRangeScanVector & rScans, Vector2<kt_d
 void ScanMatcher::AddScans(const LocalizedRangeScanMap & rScans, Vector2<kt_double> viewPoint)
 {
   m_pCorrelationGrid->Clear();
+  m_ReferenceReflectorCount = 0;
 
   // add all scans to grid
   const_forEach(LocalizedRangeScanMap, &rScans)
@@ -1110,6 +1284,27 @@ void ScanMatcher::AddScan(
     if (doSmear == true) {
       m_pCorrelationGrid->SmearPoint(gridPoint);
     }
+  }
+
+  if (!m_ReflectorsWanted) {
+    return;
+  }
+  // Reference reflector points. No view-point filter: markers are few and on walls.
+  const PointVectorDouble & rReflectorPoints = pScan->GetReflectorPoints();
+  const Rectangle2<kt_int32s> & roi = m_pReflectorGrid->GetROI();
+  for (const Vector2<kt_double> & rPoint : rReflectorPoints) {
+    Vector2<kt_int32s> gridPoint = m_pReflectorGrid->WorldToGrid(rPoint);
+    if (!math::IsUpTo(gridPoint.GetX(), roi.GetWidth()) ||
+      !math::IsUpTo(gridPoint.GetY(), roi.GetHeight()))
+    {
+      continue;
+    }
+    const int gridIndex = m_pReflectorGrid->GridIndex(gridPoint);
+    if (m_pReflectorGrid->GetDataPointer()[gridIndex] != GridStates_Occupied) {
+      m_pReflectorGrid->GetDataPointer()[gridIndex] = GridStates_Occupied;
+      m_pReflectorGrid->SmearPoint(gridPoint);
+    }
+    ++m_ReferenceReflectorCount;
   }
 }
 
@@ -1216,6 +1411,486 @@ kt_double ScanMatcher::GetResponse(kt_int32u angleIndex, kt_int32s gridPositionI
   return response;
 }
 
+kt_double ScanMatcher::GetScore(
+  kt_int32u angleIndex, kt_int32s gridPositionIndex, kt_int32s reflectorGridIndex,
+  kt_double & rAccept) const
+{
+  if (m_ScoreSource == ScoreSource::Geometry) {
+    rAccept = GetResponse(angleIndex, gridPositionIndex);
+    return rAccept;
+  }
+  if (m_ScoreSource == ScoreSource::Reflector) {
+    rAccept = GetReflectorResponse(angleIndex, reflectorGridIndex);
+    return rAccept;
+  }
+  const kt_double geometry = m_UseGeometry ? GetResponse(angleIndex, gridPositionIndex) : 0.0;
+  if (!m_ReflectorsActive) {
+    rAccept = geometry;
+    return geometry;
+  }
+  const kt_double reflector = GetReflectorResponse(angleIndex, reflectorGridIndex);
+  const kt_double g = m_UseGeometry ? 1.0 : 0.0;
+  rAccept = m_UseGeometry ? geometry : reflector;
+  return (g * geometry + m_ReflectorWeight * reflector) / (g + m_ReflectorWeight);
+}
+
+kt_double ScanMatcher::GetReflectorResponse(
+  kt_int32u angleIndex, kt_int32s reflectorGridIndex) const
+{
+  const std::vector<kt_int32s> & rOffsets = m_ReflectorOffsets[angleIndex];
+  const kt_int8u * pByte = m_pReflectorGrid->GetDataPointer() + reflectorGridIndex;
+  kt_double sum = 0.0;
+  for (size_t i = 0; i < rOffsets.size(); i++) {
+    const kt_int32s pointGridIndex = reflectorGridIndex + rOffsets[i];
+    if (rOffsets[i] == INVALID_SCAN ||
+      !math::IsUpTo(pointGridIndex, m_pReflectorGrid->GetDataSize()))
+    {
+      continue;
+    }
+    sum += m_ReflectorWeights[i] * pByte[rOffsets[i]];
+  }
+  sum /= GridStates_Occupied;
+  return math::Minimum(sum, m_ReflectorCap) / m_ReflectorCap;
+}
+
+kt_int32s ScanMatcher::ReflectorGridIndex(const Vector2<kt_double> & rPosition) const
+{
+  if (!m_ReflectorsActive) {
+    return 0;
+  }
+  return m_pReflectorGrid->GridIndex(m_pReflectorGrid->WorldToGrid(rPosition));
+}
+
+kt_bool ScanMatcher::ReflectorsAllowed() const
+{
+  if (this == m_pMapper->m_pSequentialScanMatcher) {
+    return true;
+  }
+  const MapperGraph * pGraph = m_pMapper->GetGraph();
+  return pGraph != nullptr && this == pGraph->GetLoopScanMatcher() &&
+         m_pMapper->m_pReflectorsInLoopClosure->GetValue();
+}
+
+void ScanMatcher::PrepareReflectors(LocalizedRangeScan * pScan)
+{
+  m_ReflectorsActive = false;
+  m_ReferenceReflectorCount = 0;
+  m_ReflectorWeight = m_pMapper->m_pReflectorWeight->GetValue();
+  m_ReflectorCap = math::Maximum(m_pMapper->m_pReflectorResponseCap->GetValue(), KT_TOLERANCE);
+  m_ReflectorsWanted = m_pMapper->m_pUseReflectors->GetValue() && ReflectorsAllowed() &&
+    !pScan->GetReflectorPoints().empty() &&
+    (m_ReflectorWeight > 0.0 || !m_UseGeometry);
+  if (!m_ReflectorsWanted) {
+    return;
+  }
+  if (!m_UseGeometry) {
+    // Only the reflector term counts; its weight just has to be positive.
+    m_ReflectorWeight = 1.0;
+  }
+
+  // Same extent and resolution as the geometry grid; the smear must stay within the kernel
+  // limits of CorrelationGrid (0.5 to 10 cells).
+  const kt_double resolution = m_pCorrelationGrid->GetResolution();
+  const kt_double smear = math::Clip(m_pMapper->m_pReflectorSmearDeviation->GetValue(),
+      0.5 * resolution, 10.0 * resolution);
+  if (!m_pReflectorGrid || !math::DoubleEqual(smear, m_ReflectorGridSmear)) {
+    delete m_pReflectorGrid;
+    const Rectangle2<kt_int32s> & roi = m_pCorrelationGrid->GetROI();
+    m_pReflectorGrid = CorrelationGrid::CreateGrid(roi.GetWidth(), roi.GetHeight(), resolution,
+        smear);
+    m_ReflectorGridSmear = smear;
+  }
+  m_pReflectorGrid->Clear();
+  m_ReflectorWeights = pScan->GetReflectorPointWeights();
+}
+
+void ScanMatcher::ComputeReflectorOffsets(
+  LocalizedRangeScan * pScan, kt_double angleCenter, kt_double angleOffset,
+  kt_double angleResolution)
+{
+  const kt_int32u nAngles =
+    static_cast<kt_int32u>(math::Round(angleOffset * 2.0 / angleResolution) + 1);
+  m_ReflectorOffsets.assign(nAngles, std::vector<kt_int32s>());
+
+  // reflector points in the sensor frame
+  Transform transform(pScan->GetSensorPose());
+  std::vector<Vector2<kt_double>> localPoints;
+  for (const Vector2<kt_double> & rPoint : pScan->GetReflectorPoints()) {
+    localPoints.push_back(transform.InverseTransformPose(Pose2(rPoint, 0.0)).GetPosition());
+  }
+
+  const Vector2<kt_double> & rGridOffset =
+    m_pReflectorGrid->GetCoordinateConverter()->GetOffset();
+  const kt_double startAngle = angleCenter - angleOffset;
+  for (kt_int32u angleIndex = 0; angleIndex < nAngles; angleIndex++) {
+    const kt_double angle = startAngle + angleIndex * angleResolution;
+    const kt_double cosine = cos(angle);
+    const kt_double sine = sin(angle);
+    std::vector<kt_int32s> & rOffsets = m_ReflectorOffsets[angleIndex];
+    for (const Vector2<kt_double> & rPosition : localPoints) {
+      Vector2<kt_double> offset;
+      offset.SetX(cosine * rPosition.GetX() - sine * rPosition.GetY());
+      offset.SetY(sine * rPosition.GetX() + cosine * rPosition.GetY());
+      // as GridIndexLookup: relative to the grid offset, base GridIndex to ignore the ROI
+      const Vector2<kt_int32s> gridPoint = m_pReflectorGrid->WorldToGrid(offset + rGridOffset);
+      rOffsets.push_back(m_pReflectorGrid->Grid<kt_int8u>::GridIndex(gridPoint, false));
+    }
+  }
+}
+
+kt_int32u ScanMatcher::CountMatchedReflectors(
+  LocalizedRangeScan * pScan, const Pose2 & rSensorPose) const
+{
+  if (!m_ReflectorsActive) {
+    return 0;
+  }
+  Transform from(pScan->GetSensorPose());
+  Transform to(rSensorPose);
+  const Rectangle2<kt_int32s> & roi = m_pReflectorGrid->GetROI();
+  kt_int32u matched = 0;
+  for (const Vector2<kt_double> & rPoint : pScan->GetReflectorPoints()) {
+    const Pose2 local = from.InverseTransformPose(Pose2(rPoint, 0.0));
+    const Vector2<kt_int32s> gridPoint =
+      m_pReflectorGrid->WorldToGrid(to.TransformPose(local).GetPosition());
+    if (!math::IsUpTo(gridPoint.GetX(), roi.GetWidth()) ||
+      !math::IsUpTo(gridPoint.GetY(), roi.GetHeight()))
+    {
+      continue;
+    }
+    if (m_pReflectorGrid->GetDataPointer()[m_pReflectorGrid->GridIndex(gridPoint)] >=
+      GridStates_Occupied / 2)
+    {
+      ++matched;
+    }
+  }
+  return matched;
+}
+
+namespace
+{
+// Nearest positive definite matrix: eigenvalues raised to floor. For covariances assembled from
+// separate pieces (REFLECTOR_SLAM.md §5.5), which rounding can leave slightly indefinite; an
+// indefinite one inverts to negative variances and poisons fusion and the pose graph.
+Matrix3 PositiveDefinite(const Matrix3 & rCovariance, kt_double floor = 1e-12)
+{
+  Eigen::Matrix3d m;
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      m(r, c) = 0.5 * (rCovariance(r, c) + rCovariance(c, r));
+    }
+  }
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(m);
+  m = solver.eigenvectors() * solver.eigenvalues().cwiseMax(floor).asDiagonal() *
+    solver.eigenvectors().transpose();
+  Matrix3 out;
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      out(r, c) = m(r, c);
+    }
+  }
+  return out;
+}
+}  // namespace
+
+ScanMatcher::SourceEstimate ScanMatcher::EstimateSource(
+  ScoreSource source, LocalizedRangeScan * pScan, const Pose2 & rSearchCenter,
+  const Vector2<kt_double> & rCoarseSearchOffset,
+  const Vector2<kt_double> & rCoarseSearchResolution, kt_bool doPenalize,
+  kt_bool doRefineMatch)
+{
+  SourceEstimate estimate;
+  m_ScoreSource = source;
+  const kt_double coarseAngleOffset = m_pMapper->m_pCoarseSearchAngleOffset->GetValue();
+  const kt_double coarseAngleResolution = m_pMapper->m_pCoarseAngleResolution->GetValue();
+
+  Matrix3 coarseCovariance;
+  m_ComputeFullCovariance = true;
+  estimate.response = CorrelateScan(pScan, rSearchCenter, rCoarseSearchOffset,
+      rCoarseSearchResolution, coarseAngleOffset, coarseAngleResolution, doPenalize,
+      estimate.mean, coarseCovariance, false);
+  m_ComputeFullCovariance = false;
+  const Matrix3 full = m_FullCovariance;
+  estimate.valid = estimate.response > KT_TOLERANCE;
+  if (!estimate.valid) {
+    return estimate;
+  }
+
+  // Heading variance at a fixed position, from the fine pass (the coarse angular step is too
+  // coarse for a sharp wall heading).
+  kt_double conditionalHeadingVariance = full(2, 2);
+  if (doRefineMatch) {
+    Matrix3 fineCovariance = coarseCovariance;
+    const Vector2<kt_double> fineSearchOffset(rCoarseSearchResolution * 0.5);
+    const Vector2<kt_double> fineSearchResolution(m_pCorrelationGrid->GetResolution(),
+      m_pCorrelationGrid->GetResolution());
+    estimate.response = CorrelateScan(pScan, estimate.mean, fineSearchOffset,
+        fineSearchResolution, 0.5 * coarseAngleResolution,
+        m_pMapper->m_pFineSearchAngleOffset->GetValue(), doPenalize, estimate.mean,
+        fineCovariance, true);
+    conditionalHeadingVariance = fineCovariance(2, 2);
+  }
+
+  // Position block and position-heading coupling from the coarse surface, which sees the whole
+  // window: flat directions, and the ridge of poses rotating about a single marker. Marginal
+  // heading variance = conditional (fine) + the part the coupling explains; the Schur complement
+  // is then the conditional variance, so the matrix stays positive definite.
+  Matrix3 covariance = full;
+  const kt_double a = full(0, 0);
+  const kt_double b = full(0, 1);
+  const kt_double d = full(1, 1);
+  const kt_double det = a * d - b * b;
+  const kt_double px = full(0, 2);
+  const kt_double py = full(1, 2);
+  // det is tiny for a sharp sequential match (floors of 2.5e-5 m^2): any positive value counts,
+  // or the coupling stays without its share of heading variance and the matrix is indefinite.
+  const kt_double explained = det > 0.0 ?
+    (d * px * px - 2.0 * b * px * py + a * py * py) / det : 0.0;
+  if (det <= 0.0) {
+    covariance(0, 2) = covariance(2, 0) = covariance(1, 2) = covariance(2, 1) = 0.0;
+  }
+  covariance(2, 2) = math::Maximum(conditionalHeadingVariance, KT_TOLERANCE) + explained;
+  estimate.covariance = PositiveDefinite(covariance);
+  return estimate;
+}
+
+kt_double ScanMatcher::MatchInformation(
+  LocalizedRangeScan * pScan, const Pose2 & rSearchCenter,
+  const Vector2<kt_double> & rCoarseSearchOffset,
+  const Vector2<kt_double> & rCoarseSearchResolution, kt_bool doPenalize,
+  kt_bool doRefineMatch, Pose2 & rMean, Matrix3 & rCovariance)
+{
+  const SourceEstimate geometry = EstimateSource(ScoreSource::Geometry, pScan, rSearchCenter,
+      rCoarseSearchOffset, rCoarseSearchResolution, doPenalize, doRefineMatch);
+  if (!geometry.valid) {
+    m_ScoreSource = ScoreSource::Combined;
+    return -1.0;
+  }
+  // Without reflectors in the grid (the odometry prior also comes this way) there is nothing to
+  // fuse with geometry.
+  SourceEstimate reflector;
+  if (m_ReflectorsActive) {
+    reflector = EstimateSource(ScoreSource::Reflector, pScan, rSearchCenter,
+        rCoarseSearchOffset, rCoarseSearchResolution, doPenalize, doRefineMatch);
+  }
+  m_ScoreSource = ScoreSource::Combined;
+  if (reflector.valid && !m_pMapper->m_pReflectorFuseHeading->GetValue()) {
+    // Position only: take the reflector pose at geometry's heading and drop its heading
+    // information (and the coupling), so the fused heading is geometry's.
+    reflector.mean = Pose2(reflector.mean.GetX(), reflector.mean.GetY(),
+        geometry.mean.GetHeading());
+    reflector.covariance(0, 2) = reflector.covariance(2, 0) = 0.0;
+    reflector.covariance(1, 2) = reflector.covariance(2, 1) = 0.0;
+    reflector.covariance(2, 2) = 1e6;
+  }
+
+  rMean = geometry.mean;
+  rCovariance = geometry.covariance;
+  // Determinant tolerance for these covariances: variances of 1e-6 m^2 and rad^2 give
+  // determinants around 1e-18, far below InverseFast's default.
+  const kt_double kInverseTolerance = 1e-30;
+  kt_bool fused = false;
+  kt_bool gated = false;
+  kt_double d2 = 0.0;
+
+  Matrix3 geometryInformation;
+  Matrix3 reflectorInformation;
+  if (reflector.valid && CountMatchedReflectors(pScan, reflector.mean) >= 1 &&
+    geometry.covariance.InverseFast(geometryInformation, kInverseTolerance) &&
+    reflector.covariance.InverseFast(reflectorInformation, kInverseTolerance))
+  {
+    const kt_double delta[3] = {reflector.mean.GetX() - geometry.mean.GetX(),
+      reflector.mean.GetY() - geometry.mean.GetY(),
+      math::NormalizeAngle(reflector.mean.GetHeading() - geometry.mean.GetHeading())};
+
+    // Consistency gate: d^2 = delta' (Sg + Sr)^-1 delta.
+    Matrix3 joint = geometry.covariance;
+    joint += reflector.covariance;
+    Matrix3 jointInverse;
+    if (joint.InverseFast(jointInverse, kInverseTolerance)) {
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+          d2 += delta[r] * jointInverse(r, c) * delta[c];
+        }
+      }
+    }
+    const kt_double chi2 = m_pMapper->m_pReflectorConsistencyGateChi2->GetValue();
+    gated = chi2 > 0.0 && d2 > chi2;
+
+    // Fusion: S = (Sg^-1 + Sr^-1)^-1, T = Tg + S Sr^-1 delta.
+    Matrix3 information = geometryInformation;
+    information += reflectorInformation;
+    Matrix3 fusedCovariance;
+    if (!gated && information.InverseFast(fusedCovariance, kInverseTolerance)) {
+      kt_double weighted[3] = {0.0, 0.0, 0.0};
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+          weighted[r] += reflectorInformation(r, c) * delta[c];
+        }
+      }
+      kt_double step[3] = {0.0, 0.0, 0.0};
+      for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+          step[r] += fusedCovariance(r, c) * weighted[c];
+        }
+      }
+      rMean = Pose2(geometry.mean.GetX() + step[0], geometry.mean.GetY() + step[1],
+          math::NormalizeAngle(geometry.mean.GetHeading() + step[2]));
+      rCovariance = PositiveDefinite(fusedCovariance);
+      fused = true;
+    }
+  }
+
+  if (doPenalize) {
+    m_LastReflectorStats.active = m_ReflectorsActive;
+    m_LastReflectorStats.scanPoints = static_cast<kt_int32u>(pScan->GetReflectorPoints().size());
+    m_LastReflectorStats.referencePoints = m_ReferenceReflectorCount;
+    m_LastReflectorStats.matched = CountMatchedReflectors(pScan, rMean);
+    m_LastReflectorStats.response = geometry.response;
+    m_LastReflectorStats.fused = fused;
+    m_LastReflectorStats.gated = gated;
+    m_LastReflectorStats.gateD2 = d2;
+  }
+  return math::Minimum(geometry.response, 1.0);
+}
+
+
+void ScanMatcher::FinishSequentialMatch(
+  LocalizedRangeScan * pScan, const Pose2 & rPredicted, Pose2 & rMean,
+  const Matrix3 & rCovariance)
+{
+  m_LastMatch.valid = true;
+  m_LastMatch.predicted = rPredicted;
+  m_LastMatch.scanMean = rMean;
+  m_LastMatch.scanCovariance = rCovariance;
+  m_LastMatch.mean = rMean;
+  m_LastMatch.poseCovariance = rCovariance;
+  if (!m_pMapper->m_pOdometryPriorFusion->GetValue()) {
+    return;
+  }
+  const LocalizedRangeScan * pLastScan =
+    m_pMapper->m_pMapperSensorManager->GetLastScan(pScan->GetSensorName());
+  if (pLastScan == NULL) {
+    return;
+  }
+
+  // Prior from the odometry motion since the last scan: position and heading uncertainty of
+  // the robot, growing with distance and turn.
+  const Pose2 & rFrom = pLastScan->GetOdometricPose();
+  const Pose2 & rTo = pScan->GetOdometricPose();
+  const kt_double distance = (rTo.GetPosition() - rFrom.GetPosition()).Length();
+  const kt_double turn = std::fabs(math::NormalizeAngle(rTo.GetHeading() - rFrom.GetHeading()));
+  // Along the direction of travel odometry errs by its scale; across it by heading error times
+  // distance, which a wall usually knows better.
+  const kt_double sigmaAlong = m_pMapper->m_pOdometryPriorStddevXyPerMeter->GetValue() *
+    distance + m_pMapper->m_pOdometryPriorStddevXyMin->GetValue();
+  const kt_double sigmaCross = m_pMapper->m_pOdometryPriorStddevCrossPerMeter->GetValue() *
+    distance + m_pMapper->m_pOdometryPriorStddevXyMin->GetValue();
+  const kt_double sigmaYaw =
+    m_pMapper->m_pOdometryPriorStddevYawPerRadian->GetValue() * turn +
+    m_pMapper->m_pOdometryPriorStddevYawPerMeter->GetValue() * distance +
+    m_pMapper->m_pOdometryPriorStddevYawMin->GetValue();
+  // The match is of the sensor pose: a robot heading error also moves the sensor, by the
+  // lever arm of its mounting offset.
+  const Pose2 & rOffset = pScan->GetLaserRangeFinder()->GetOffsetPose();
+  const kt_double varYaw = math::Square(sigmaYaw);
+  // Position block in the map frame, from along/across the robot's predicted heading.
+  const kt_double travelHeading = rPredicted.GetHeading() - rOffset.GetHeading();
+  const kt_double ch = cos(travelHeading);
+  const kt_double sh = sin(travelHeading);
+  const kt_double varAlong = math::Square(sigmaAlong);
+  const kt_double varCross = math::Square(sigmaCross);
+  const kt_double pxx = ch * ch * varAlong + sh * sh * varCross;
+  const kt_double pyy = sh * sh * varAlong + ch * ch * varCross;
+  const kt_double pxy = ch * sh * (varAlong - varCross);
+  Pose2 predicted = rPredicted;
+  Matrix3 prior;
+  if (m_pMapper->m_pOdometryPriorFuseHeading->GetValue()) {
+    const kt_double robotHeading = rPredicted.GetHeading() - rOffset.GetHeading();
+    const kt_double c = cos(robotHeading);
+    const kt_double s = sin(robotHeading);
+    const kt_double jx = -s * rOffset.GetX() - c * rOffset.GetY();
+    const kt_double jy = c * rOffset.GetX() - s * rOffset.GetY();
+    prior(0, 0) = pxx + jx * jx * varYaw;
+    prior(1, 1) = pyy + jy * jy * varYaw;
+    prior(0, 1) = prior(1, 0) = pxy + jx * jy * varYaw;
+    prior(0, 2) = prior(2, 0) = jx * varYaw;
+    prior(1, 2) = prior(2, 1) = jy * varYaw;
+    prior(2, 2) = varYaw;
+  } else {
+    // Position only. Odometry's heading drifts (gyro bias, scrub) and a wall fixes heading far
+    // better than the coarse-search floor of the scan's heading variance admits, so taking
+    // heading from odometry walked the pose across a corridor (REFLECTOR_SLAM.md 5.10). The prior
+    // is the odometry robot position with the sensor placed at the scan's heading.
+    const kt_double predictedRobotHeading = rPredicted.GetHeading() - rOffset.GetHeading();
+    const kt_double robotX = rPredicted.GetX() - (cos(predictedRobotHeading) * rOffset.GetX() -
+      sin(predictedRobotHeading) * rOffset.GetY());
+    const kt_double robotY = rPredicted.GetY() - (sin(predictedRobotHeading) * rOffset.GetX() +
+      cos(predictedRobotHeading) * rOffset.GetY());
+    const kt_double scanRobotHeading = rMean.GetHeading() - rOffset.GetHeading();
+    predicted = Pose2(
+      robotX + cos(scanRobotHeading) * rOffset.GetX() - sin(scanRobotHeading) * rOffset.GetY(),
+      robotY + sin(scanRobotHeading) * rOffset.GetX() + cos(scanRobotHeading) * rOffset.GetY(),
+      rMean.GetHeading());
+    prior(0, 0) = pxx;
+    prior(1, 1) = pyy;
+    prior(0, 1) = prior(1, 0) = pxy;
+    prior(2, 2) = 1e6;
+  }
+
+  const kt_double kInverseTolerance = 1e-30;
+  const kt_double delta[3] = {rMean.GetX() - predicted.GetX(),
+    rMean.GetY() - predicted.GetY(),
+    math::NormalizeAngle(rMean.GetHeading() - predicted.GetHeading())};
+  Matrix3 joint = rCovariance;
+  joint += prior;
+  Matrix3 jointInverse;
+  Matrix3 scanInformation;
+  Matrix3 priorInformation;
+  if (!joint.InverseFast(jointInverse, kInverseTolerance) ||
+    !rCovariance.InverseFast(scanInformation, kInverseTolerance) ||
+    !prior.InverseFast(priorInformation, kInverseTolerance))
+  {
+    return;
+  }
+  kt_double d2 = 0.0;
+  for (int r = 0; r < 3; r++) {
+    for (int k = 0; k < 3; k++) {
+      d2 += delta[r] * jointInverse(r, k) * delta[k];
+    }
+  }
+  m_LastMatch.priorD2 = d2;
+  // A scan far from odometry is more likely right (wheel slip) than a blind direction: keep it.
+  const kt_double gate = m_pMapper->m_pOdometryPriorGateChi2->GetValue();
+  if (gate > 0.0 && d2 > gate) {
+    m_LastMatch.priorGated = true;
+    return;
+  }
+
+  // Fusion: S = (Ss^-1 + So^-1)^-1, T = To + S Ss^-1 (Ts - To).
+  Matrix3 information = scanInformation;
+  information += priorInformation;
+  Matrix3 fused;
+  if (!information.InverseFast(fused, kInverseTolerance)) {
+    return;
+  }
+  kt_double weighted[3] = {0.0, 0.0, 0.0};
+  for (int r = 0; r < 3; r++) {
+    for (int k = 0; k < 3; k++) {
+      weighted[r] += scanInformation(r, k) * delta[k];
+    }
+  }
+  kt_double step[3] = {0.0, 0.0, 0.0};
+  for (int r = 0; r < 3; r++) {
+    for (int k = 0; k < 3; k++) {
+      step[r] += fused(r, k) * weighted[k];
+    }
+  }
+  rMean = Pose2(predicted.GetX() + step[0], predicted.GetY() + step[1],
+      math::NormalizeAngle(predicted.GetHeading() + step[2]));
+  m_LastMatch.prior = true;
+  m_LastMatch.mean = rMean;
+  m_LastMatch.poseCovariance = PositiveDefinite(fused);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -1442,9 +2117,11 @@ Vertex<LocalizedRangeScan> * MapperGraph::AddVertex(LocalizedRangeScan * pScan)
 
 void MapperGraph::AddEdges(LocalizedRangeScan * pScan, const Matrix3 & rCovariance)
 {
+  m_LinkOrigin = LinkInfo::kOriginSequential;
   MapperSensorManager * pSensorManager = m_pMapper->m_pMapperSensorManager;
 
   const Name rSensorName = pScan->GetSensorName();
+
 
   // link to previous scan
   kt_int32s previousScanNum = pScan->GetStateId() - 1;
@@ -1494,7 +2171,13 @@ void MapperGraph::AddEdges(LocalizedRangeScan * pScan, const Matrix3 & rCovarian
     // link to running scans
     Pose2 scanPose = pScan->GetSensorPose();
     means.push_back(scanPose);
-    covariances.push_back(rCovariance);
+    // With the odometry prior (REFLECTOR_SLAM.md 5.10) the pose also carries odometry's
+    // information: weigh it against near chains by the fused covariance. The edges keep the
+    // fused pose: the scan-only one sits on the search window's edge along a corridor, and as an
+    // edge it outvoted the odometry edges and brought the start-up lag back (§7.2).
+    const ScanMatcher::MatchDiagnostics & rMatch =
+      m_pMapper->m_pSequentialScanMatcher->GetLastMatch();
+    covariances.push_back(rMatch.valid && rMatch.prior ? rMatch.poseCovariance : rCovariance);
     LinkChainToScan(pSensorManager->GetRunningScans(rSensorName), pScan, scanPose, rCovariance);
   }
 
@@ -1516,6 +2199,137 @@ void MapperGraph::AddEdges(LocalizedRangeScan * pScan, const Matrix3 & rCovarian
   }
 }
 
+kt_bool MapperGraph::ClosureConsistentWithGraph(
+  const LocalizedRangeScanVector & rChain, LocalizedRangeScan * pScan, const Pose2 & rClosurePose,
+  const Matrix3 & rCovariance)
+{
+  const kt_double chi2 = m_pMapper->m_pLoopClosureGateChi2->GetValue();
+  if (chi2 <= 0.0) {
+    return true;
+  }
+  // L4 (REFLECTOR_SLAM.md §5.9): the correction the closure demands, delta = closure pose -
+  // current pose of the scan (the chain is the reference), against the closure's covariance
+  // plus the drift the graph may have accumulated over the path from the chain to the scan.
+  const Pose2 current = pScan->GetSensorPose();
+  const kt_double delta[3] = {rClosurePose.GetX() - current.GetX(),
+    rClosurePose.GetY() - current.GetY(),
+    math::NormalizeAngle(rClosurePose.GetHeading() - current.GetHeading())};
+
+  const LocalizedRangeScan * pClosest = GetClosestScanToPose(rChain, rClosurePose);
+  kt_double pathLength = 0.0;
+  if (pClosest != nullptr) {
+    MapperSensorManager * pSensorManager = m_pMapper->m_pMapperSensorManager;
+    const kt_int32s from = math::Minimum(pClosest->GetUniqueId(), pScan->GetUniqueId());
+    const kt_int32s to = math::Maximum(pClosest->GetUniqueId(), pScan->GetUniqueId());
+    const LocalizedRangeScan * pPrevious = nullptr;
+    for (kt_int32s id = from; id <= to; ++id) {
+      const LocalizedRangeScan * pNext = id == pScan->GetUniqueId() ? pScan :
+        pSensorManager->GetScan(id);
+      if (pNext == nullptr) {
+        continue;
+      }
+      if (pPrevious != nullptr) {
+        pathLength += pPrevious->GetCorrectedPose().GetPosition().Distance(
+          pNext->GetCorrectedPose().GetPosition());
+      }
+      pPrevious = pNext;
+    }
+  }
+  Matrix3 joint = rCovariance;
+  const kt_double driftXY = m_pMapper->m_pLoopClosureGateDriftXY->GetValue() * pathLength;
+  const kt_double driftYaw = m_pMapper->m_pLoopClosureGateDriftYaw->GetValue() * pathLength;
+  joint(0, 0) += driftXY * driftXY;
+  joint(1, 1) += driftXY * driftXY;
+  joint(2, 2) += driftYaw * driftYaw;
+  Matrix3 information;
+  if (!joint.InverseFast(information, 1e-30)) {
+    return true;
+  }
+  kt_double d2 = 0.0;
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 3; c++) {
+      d2 += delta[r] * information(r, c) * delta[c];
+    }
+  }
+  return d2 <= chi2;
+}
+
+kt_bool MapperGraph::MatchChainGated(
+  LocalizedRangeScan * pScan, const LocalizedRangeScanVector & rChain,
+  kt_double minimumCoarseResponse, kt_double minimumFineResponse, LoopClosureStats & rStats,
+  Pose2 & rMean, Matrix3 & rCovariance)
+{
+  // Coarse: the loop matcher's wide search (with the reflector layer and the ridge-aware
+  // covariance when enabled, §5.9 L1/L5), gated on response and variance.
+  Matrix3 covariance;
+  const kt_double coarseResponse = m_pLoopScanMatcher->MatchScan(pScan, rChain, rMean,
+      covariance, false, false);
+  const Matrix3 coarseCovariance = covariance;
+  ++rStats.attempts;
+  rStats.coarseResponses.push_back(coarseResponse);
+  if (m_pLoopScanMatcher->LastMatchUsedReflectors()) {
+    ++rStats.reflectorsActive;
+  }
+
+  std::stringstream stream;
+  stream << "COARSE RESPONSE: " << coarseResponse <<
+    " (> " << minimumCoarseResponse << ")" << std::endl;
+  stream << "            var: " << covariance(0, 0) << ",  " << covariance(1, 1) <<
+    " (< " << m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() << ")";
+  m_pMapper->FireLoopClosureCheck(stream.str());
+
+  if (coarseResponse <= minimumCoarseResponse) {
+    ++rStats.rejectedCoarseResponse;
+    return false;
+  }
+  if (covariance(0, 0) >= m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() ||
+    covariance(1, 1) >= m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue())
+  {
+    ++rStats.rejectedVariance;
+    return false;
+  }
+
+  // Fine: the sequential matcher around the coarse pose, on a copy of the scan placed there.
+  LocalizedRangeScan tmpScan(pScan->GetSensorName(), pScan->GetRangeReadingsVector());
+  tmpScan.SetUniqueId(pScan->GetUniqueId());
+  tmpScan.SetTime(pScan->GetTime());
+  tmpScan.SetStateId(pScan->GetStateId());
+  tmpScan.SetCorrectedPose(pScan->GetCorrectedPose());
+  // The copy is made from the ranges only; carry the reflector data over when matching with
+  // reflectors (REFLECTOR_SLAM.md §5.9, L5).
+  if (m_pMapper->m_pReflectorsInLoopClosure->GetValue()) {
+    tmpScan.SetReflectorWeights(pScan->GetReflectorWeights());
+  }
+  tmpScan.SetSensorPose(rMean);    // This also updates OdometricPose.
+  const kt_double fineResponse = m_pMapper->m_pSequentialScanMatcher->MatchScan(&tmpScan,
+      rChain, rMean, covariance, false);
+
+  std::stringstream stream1;
+  stream1 << "FINE RESPONSE: " << fineResponse << " (>" << minimumFineResponse << ")" <<
+    std::endl;
+  m_pMapper->FireLoopClosureCheck(stream1.str());
+
+  // L2: the fine match only sees +-half a coarse step, so its covariance cannot show the coarse
+  // search's ambiguity (a ridge along a corridor); keep both.
+  if (m_pMapper->m_pLoopClosureCoarseCovariance->GetValue()) {
+    covariance += coarseCovariance;
+  }
+  rCovariance = PositiveDefinite(covariance);
+
+  if (fineResponse < minimumFineResponse) {
+    ++rStats.rejectedFineResponse;
+    m_pMapper->FireLoopClosureCheck("REJECTED!");
+    return false;
+  }
+  if (!ClosureConsistentWithGraph(rChain, pScan, rMean, rCovariance)) {
+    ++rStats.rejectedGate;
+    m_pMapper->FireLoopClosureCheck("REJECTED by the consistency gate");
+    return false;
+  }
+  ++rStats.accepted;
+  return true;
+}
+
 kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSensorName)
 {
   kt_bool loopClosed = false;
@@ -1527,50 +2341,26 @@ kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSens
   while (!candidateChain.empty()) {
     Pose2 bestPose;
     Matrix3 covariance;
-    kt_double coarseResponse = m_pLoopScanMatcher->MatchScan(pScan, candidateChain,
-        bestPose, covariance, false, false);
-
-    std::stringstream stream;
-    stream << "COARSE RESPONSE: " << coarseResponse <<
-      " (> " << m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue() << ")" <<
-      std::endl;
-    stream << "            var: " << covariance(0, 0) << ",  " << covariance(1, 1) <<
-      " (< " << m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() << ")";
-
-    m_pMapper->FireLoopClosureCheck(stream.str());
-
-    if ((coarseResponse > m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue()) &&
-      (covariance(0, 0) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()) &&
-      (covariance(1, 1) < m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue()))
+    if (MatchChainGated(pScan, candidateChain,
+      m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue(),
+      m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue(), m_LoopClosureStats, bestPose,
+      covariance))
     {
-      LocalizedRangeScan tmpScan(pScan->GetSensorName(), pScan->GetRangeReadingsVector());
-      tmpScan.SetUniqueId(pScan->GetUniqueId());
-      tmpScan.SetTime(pScan->GetTime());
-      tmpScan.SetStateId(pScan->GetStateId());
-      tmpScan.SetCorrectedPose(pScan->GetCorrectedPose());
-      tmpScan.SetSensorPose(bestPose);    // This also updates OdometricPose.
-      kt_double fineResponse = m_pMapper->m_pSequentialScanMatcher->MatchScan(&tmpScan,
-          candidateChain,
-          bestPose, covariance, false);
+      m_pMapper->FireBeginLoopClosure("Closing loop...");
 
-      std::stringstream stream1;
-      stream1 << "FINE RESPONSE: " << fineResponse << " (>" <<
-        m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue() << ")" << std::endl;
-      m_pMapper->FireLoopClosureCheck(stream1.str());
-
-      if (fineResponse < m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue()) {
-        m_pMapper->FireLoopClosureCheck("REJECTED!");
-      } else {
-        m_pMapper->FireBeginLoopClosure("Closing loop...");
-
+      // Stock Karto moves the scan to the closure pose before the solve, so the online pose
+      // jumps by the full correction however uncertain the closure; off, the solve decides.
+      if (m_pMapper->m_pLoopClosureMoveScan->GetValue()) {
         pScan->SetSensorPose(bestPose);
-        LinkChainToScan(candidateChain, pScan, bestPose, covariance);
-        CorrectPoses();
-
-        m_pMapper->FireEndLoopClosure("Loop closed!");
-
-        loopClosed = true;
       }
+      m_LinkOrigin = LinkInfo::kOriginLoopClosure;
+      LinkChainToScan(candidateChain, pScan, bestPose, covariance);
+      m_LinkOrigin = LinkInfo::kOriginSequential;
+      CorrectPoses();
+
+      m_pMapper->FireEndLoopClosure("Loop closed!");
+
+      loopClosed = true;
     }
 
     candidateChain = FindPossibleLoopClosure(pScan, rSensorName, scanIndex);
@@ -1650,6 +2440,7 @@ void MapperGraph::LinkScans(
   if (isNewEdge == true) {
     LinkInfo * pLinkInfo = new LinkInfo(
       pFromScan->GetCorrectedPose(), pToScan->GetCorrectedAt(rMean), rCovariance);
+    pLinkInfo->SetOrigin(m_LinkOrigin);
     // also record the raw sensor-frame measurement (before the current, possibly wrong,
     // lidar<->base_link offset was applied/removed) so it can be used for online joint
     // extrinsic calibration; rMean is already the matcher's sensor-frame output for pToScan.
@@ -1684,6 +2475,7 @@ void MapperGraph::LinkNearChains(
   LocalizedRangeScan * pScan, Pose2Vector & rMeans,
   std::vector<Matrix3> & rCovariances)
 {
+  m_LinkOrigin = LinkInfo::kOriginNearChain;
   const std::vector<LocalizedRangeScanVector> nearChains = FindNearChains(pScan);
   const_forEach(std::vector<LocalizedRangeScanVector>, &nearChains)
   {
@@ -1693,10 +2485,22 @@ void MapperGraph::LinkNearChains(
 
     Pose2 mean;
     Matrix3 covariance;
-    // match scan against "near" chain
-    kt_double response = m_pMapper->m_pSequentialScanMatcher->MatchScan(pScan, *iter, mean,
-        covariance, false);
-    if (response > m_pMapper->m_pLinkMatchMinimumResponseFine->GetValue() - KT_TOLERANCE) {
+    kt_bool link = false;
+    if (m_pMapper->m_pNearChainGated->GetValue()) {
+      // L6 (REFLECTOR_SLAM.md §5.9): the sequential matcher only searches +-half its window
+      // around the current, possibly drifted pose, so in a featureless corridor it confirms
+      // the drift and states it as tight. Match near chains like loop closures instead.
+      link = MatchChainGated(pScan, *iter,
+          m_pMapper->m_pNearChainMinimumResponseCoarse->GetValue(),
+          m_pMapper->m_pLinkMatchMinimumResponseFine->GetValue() - KT_TOLERANCE,
+          m_NearChainStats, mean, covariance);
+    } else {
+      // match scan against "near" chain
+      kt_double response = m_pMapper->m_pSequentialScanMatcher->MatchScan(pScan, *iter, mean,
+          covariance, false);
+      link = response > m_pMapper->m_pLinkMatchMinimumResponseFine->GetValue() - KT_TOLERANCE;
+    }
+    if (link) {
       rMeans.push_back(mean);
       rCovariances.push_back(covariance);
       LinkChainToScan(*iter, pScan, mean, covariance);
@@ -1710,6 +2514,12 @@ void MapperGraph::LinkChainToScan(
 {
   Pose2 pose = pScan->GetReferencePose(m_pMapper->m_pUseScanBarycenter->GetValue());
 
+  const kt_int32u chainScans = m_pMapper->m_pLinkChainScans->GetValue();
+  if (chainScans > 1) {
+    LinkChainToScanSpread(rChain, pScan, pose, rMean, rCovariance, chainScans);
+    return;
+  }
+
   LocalizedRangeScan * pClosestScan = GetClosestScanToPose(rChain, pose);
   assert(pClosestScan != NULL);
 
@@ -1721,6 +2531,84 @@ void MapperGraph::LinkChainToScan(
     math::Square(m_pMapper->m_pLinkScanMaximumDistance->GetValue()) + KT_TOLERANCE)
   {
     LinkScans(pClosestScan, pScan, rMean, rCovariance);
+  }
+}
+
+void MapperGraph::LinkChainToScanSpread(
+  const LocalizedRangeScanVector & rChain, LocalizedRangeScan * pScan, const Pose2 & rPose,
+  const Pose2 & rMean, const Matrix3 & rCovariance, kt_int32u chainScans)
+{
+  // L9 (REFLECTOR_SLAM.md §5.9): the match places the scan against the chain as a whole, so
+  // link it to the chain's closest scans, not just one: a scan misplaced within a bent chain
+  // then carries 1/n of the match instead of all of it.
+  const kt_double maximumSquaredDistance =
+    math::Square(m_pMapper->m_pLinkScanMaximumDistance->GetValue()) + KT_TOLERANCE;
+  const kt_bool barycenter = m_pMapper->m_pUseScanBarycenter->GetValue();
+
+  // Scans already linked to this one: an edge between two scans exists once, and LinkScans
+  // would drop a second measurement (e.g. the previous scan's sequential edge).
+  std::set<const LocalizedRangeScan *> linked;
+  const auto vertex = m_Vertices[pScan->GetSensorName()].find(pScan->GetStateId());
+  if (vertex != m_Vertices[pScan->GetSensorName()].end()) {
+    for (const Edge<LocalizedRangeScan> * pEdge : vertex->second->GetEdges()) {
+      linked.insert(pEdge->GetSource()->GetObject());
+      linked.insert(pEdge->GetTarget()->GetObject());
+    }
+  }
+
+  // As the single link: if the closest scan is already linked (the running buffer's previous
+  // scan, by its sequential edge), the match is represented and nothing is added. Spreading
+  // past it added the same match again on top of that edge, which outweighed odometry in the
+  // solves along corridors without markers.
+  LocalizedRangeScan * pClosest = GetClosestScanToPose(rChain, rPose);
+  if (pClosest == NULL || linked.count(pClosest) > 0) {
+    return;
+  }
+
+  std::vector<std::pair<kt_double, LocalizedRangeScan *>> candidates;
+  for (LocalizedRangeScan * pCandidate : rChain) {
+    if (pCandidate == pScan || linked.count(pCandidate) > 0) {
+      continue;
+    }
+    const kt_double squaredDistance = rPose.GetPosition().SquaredDistance(
+      pCandidate->GetReferencePose(barycenter).GetPosition());
+    if (squaredDistance < maximumSquaredDistance) {
+      candidates.emplace_back(squaredDistance, pCandidate);
+    }
+  }
+  const size_t n = std::min<size_t>(chainScans, candidates.size());
+  if (n == 0) {
+    return;
+  }
+  std::partial_sort(candidates.begin(), candidates.begin() + n, candidates.end(),
+    [](const auto & a, const auto & b) {return a.first < b.first;});
+
+  // Each edge with 1/n of the match's information, so together they state it once, plus the
+  // lever arm: the scan's position relative to a chain scan d metres away is also off by
+  // heading error times d, perpendicular to d (as uncertain as the match's heading). Without
+  // it the far edges were overconfident and bent the online pose on the loops (§7.2).
+  const kt_double headingVariance = rCovariance(2, 2);
+  for (size_t i = 0; i < n; i++) {
+    LocalizedRangeScan * pFrom = candidates[i].second;
+    const kt_double rx = rMean.GetX() - pFrom->GetSensorPose().GetX();
+    const kt_double ry = rMean.GetY() - pFrom->GetSensorPose().GetY();
+    Matrix3 covariance;
+    for (int r = 0; r < 3; r++) {
+      for (int k = 0; k < 3; k++) {
+        covariance(r, k) = rCovariance(r, k) * static_cast<kt_double>(n);
+      }
+    }
+    // + headingVariance * a a' with a = (-ry, rx, 1): position moves with the heading error
+    covariance(2, 2) += headingVariance;
+    covariance(0, 0) += headingVariance * ry * ry;
+    covariance(1, 1) += headingVariance * rx * rx;
+    covariance(0, 1) -= headingVariance * rx * ry;
+    covariance(1, 0) -= headingVariance * rx * ry;
+    covariance(0, 2) -= headingVariance * ry;
+    covariance(2, 0) -= headingVariance * ry;
+    covariance(1, 2) += headingVariance * rx;
+    covariance(2, 1) += headingVariance * rx;
+    LinkScans(pFrom, pScan, rMean, PositiveDefinite(covariance));
   }
 }
 
@@ -1980,10 +2868,19 @@ Pose2 MapperGraph::ComputeWeightedMean(
   kt_double thetaX = 0.0;
   kt_double thetaY = 0.0;
 
+  // The weights are full 3x3 information matrices, so a mean's heading enters the weighted x
+  // and y through the position-heading terms. Means on either side of +-pi differ by 2 pi in
+  // heading and would shift the position by metres; put every heading within pi of the first.
+  const kt_double referenceHeading = rMeans.front().GetHeading();
   Pose2Vector::const_iterator meansIter = rMeans.begin();
   const_forEach(std::vector<Matrix3>, &inverses)
   {
     Pose2 pose = *meansIter;
+    if (pose.GetHeading() - referenceHeading > KT_PI) {
+      pose.SetHeading(pose.GetHeading() - KT_2PI);
+    } else if (pose.GetHeading() - referenceHeading < -KT_PI) {
+      pose.SetHeading(pose.GetHeading() + KT_2PI);
+    }
     kt_double angle = pose.GetHeading();
     thetaX += cos(angle);
     thetaY += sin(angle);
@@ -2069,26 +2966,39 @@ void MapperGraph::CorrectPoses()
       scan->SetCorrectedPoseAndUpdate(iter->second);
     }
 
-    // feed the jointly-optimized sensor extrinsic estimate (if any) back into karto: this
-    // instantly and retroactively affects GetSensorPose()/GetSensorAt() for every scan of that
-    // sensor, so mark them dirty to force cached point clouds to be rebuilt against it.
-    for (const auto & sensorCorrection : pSolver->GetSensorOffsetCorrections()) {
-      const Name sensorName(sensorCorrection.first);
-      LaserRangeFinder * pLrf =
-        SensorManager::GetInstance()->GetSensorByName<LaserRangeFinder>(sensorName);
-      if (pLrf) {
-        pLrf->SetOffsetPose(sensorCorrection.second);
-        LocalizedRangeScanMap & scans = m_pMapper->m_pMapperSensorManager->GetScans(sensorName);
-        kt_bool dirty = true;
-        for (auto & idScan : scans) {
-          if (idScan.second) {
-            idScan.second->SetIsDirty(dirty);
-          }
-        }
-      }
-    }
+    m_pMapper->ApplySensorOffsetCorrections();
 
     pSolver->Clear();
+  }
+}
+
+void Mapper::ApplySensorOffsetCorrections()
+{
+  ScanSolver * pSolver = m_pScanOptimizer;
+  if (pSolver == NULL) {
+    return;
+  }
+  // feed the jointly-optimized sensor extrinsic estimate (if any) back into karto: this
+  // instantly and retroactively affects GetSensorPose()/GetSensorAt() for every scan of that
+  // sensor, so mark them dirty to force cached point clouds to be rebuilt against it.
+  for (const auto & sensorCorrection : pSolver->GetSensorOffsetCorrections()) {
+    const Name sensorName(sensorCorrection.first);
+    LaserRangeFinder * pLrf =
+      SensorManager::GetInstance()->GetSensorByName<LaserRangeFinder>(sensorName);
+    if (pLrf == NULL) {
+      continue;
+    }
+    pLrf->SetOffsetPose(sensorCorrection.second);
+    // no scans yet before the first one is processed
+    if (m_pMapperSensorManager == NULL || !m_pMapperSensorManager->HasScanManager(sensorName)) {
+      continue;
+    }
+    kt_bool dirty = true;
+    for (auto & idScan : m_pMapperSensorManager->GetScans(sensorName)) {
+      if (idScan.second) {
+        idScan.second->SetIsDirty(dirty);
+      }
+    }
   }
 }
 
@@ -2377,6 +3287,146 @@ void Mapper::InitializeParameters()
     "OccupancyThreshold",
     "Minimum ratio of beams hitting cell to beams passing through cell to be marked as occupied",
     0.1, GetParameterManager());
+
+  m_pUseReflectors = new Parameter<kt_bool>(
+    "UseReflectors",
+    "Whether sequential scan matching also matches the scans' reflector points.",
+    false, GetParameterManager());
+
+  m_pUseGeometry = new Parameter<kt_bool>(
+    "UseGeometry",
+    "Whether scan matching uses the geometry; false matches on reflectors only.",
+    true, GetParameterManager());
+
+  m_pReflectorWeight = new Parameter<kt_double>(
+    "ReflectorWeight",
+    "Weight of the reflector response against the geometry response.",
+    1.0, GetParameterManager());
+
+  m_pReflectorSmearDeviation = new Parameter<kt_double>(
+    "ReflectorSmearDeviation",
+    "Smear deviation of the reflector correlation grid.",
+    0.02, GetParameterManager());
+
+  m_pReflectorResponseCap = new Parameter<kt_double>(
+    "ReflectorResponseCap",
+    "Summed weighted reflector hits at which the reflector response saturates at 1.",
+    3.0, GetParameterManager());
+
+  m_pReflectorInformationFusion = new Parameter<kt_bool>(
+    "ReflectorInformationFusion",
+    "Fuse separate geometry and reflector estimates by their covariances.",
+    false, GetParameterManager());
+
+  m_pReflectorCovarianceWindow = new Parameter<kt_double>(
+    "ReflectorCovarianceWindow",
+    "Relative response window for the response-surface covariances.",
+    0.9, GetParameterManager());
+
+  m_pReflectorConsistencyGateChi2 = new Parameter<kt_double>(
+    "ReflectorConsistencyGateChi2",
+    "chi^2 bound on the disagreement of the geometry and reflector estimates; 0 disables it.",
+    11.34, GetParameterManager());
+
+  m_pReflectorFuseHeading = new Parameter<kt_bool>(
+    "ReflectorFuseHeading",
+    "Whether the reflector estimate informs heading in information fusion.",
+    true, GetParameterManager());
+
+  m_pReflectorsInLoopClosure = new Parameter<kt_bool>(
+    "ReflectorsInLoopClosure",
+    "Whether loop closure uses the reflectors too.",
+    false, GetParameterManager());
+
+  m_pLoopMatchRelativeCovariance = new Parameter<kt_bool>(
+    "LoopMatchRelativeCovariance",
+    "Loop matcher coarse covariance from the relative-window 3x3 moments.",
+    false, GetParameterManager());
+
+  m_pLoopClosureCoarseCovariance = new Parameter<kt_bool>(
+    "LoopClosureCoarseCovariance",
+    "Closure edge covariance keeps the coarse search ambiguity (fine + coarse).",
+    false, GetParameterManager());
+
+  m_pLoopClosureMoveScan = new Parameter<kt_bool>(
+    "LoopClosureMoveScan",
+    "Whether an accepted closure moves the scan before the solve.",
+    true, GetParameterManager());
+
+  m_pLoopClosureGateChi2 = new Parameter<kt_double>(
+    "LoopClosureGateChi2",
+    "chi^2 gate of a closure against the current graph; 0 disables it.",
+    0.0, GetParameterManager());
+
+  m_pLoopClosureGateDriftXY = new Parameter<kt_double>(
+    "LoopClosureGateDriftXY",
+    "Assumed position drift per metre of path for the closure gate.",
+    0.05, GetParameterManager());
+
+  m_pOdometryPriorFusion = new Parameter<kt_bool>(
+    "OdometryPriorFusion",
+    "Fuse the sequential match with the odometry prediction by information (REFLECTOR_SLAM.md 5.10, S2).",
+    false, GetParameterManager());
+
+  m_pOdometryPriorStddevXyPerMeter = new Parameter<kt_double>(
+    "OdometryPriorStddevXyPerMeter",
+    "Odometry prior: position standard deviation per metre driven.",
+    0.05, GetParameterManager());
+
+  m_pOdometryPriorStddevXyMin = new Parameter<kt_double>(
+    "OdometryPriorStddevXyMin",
+    "Odometry prior: position standard deviation floor (m).",
+    0.005, GetParameterManager());
+
+  m_pOdometryPriorStddevYawPerRadian = new Parameter<kt_double>(
+    "OdometryPriorStddevYawPerRadian",
+    "Odometry prior: heading standard deviation per radian turned.",
+    0.05, GetParameterManager());
+
+  m_pOdometryPriorStddevYawPerMeter = new Parameter<kt_double>(
+    "OdometryPriorStddevYawPerMeter",
+    "Odometry prior: heading standard deviation per metre driven (rad/m).",
+    0.01, GetParameterManager());
+
+  m_pOdometryPriorStddevYawMin = new Parameter<kt_double>(
+    "OdometryPriorStddevYawMin",
+    "Odometry prior: heading standard deviation floor (rad).",
+    0.002, GetParameterManager());
+
+  m_pOdometryPriorGateChi2 = new Parameter<kt_double>(
+    "OdometryPriorGateChi2",
+    "Odometry prior: no fusion when the scan and odometry disagree beyond this chi^2 (3 DOF); 0 = always fuse.",
+    11.34, GetParameterManager());
+
+  m_pOdometryPriorStddevCrossPerMeter = new Parameter<kt_double>(
+    "OdometryPriorStddevCrossPerMeter",
+    "Odometry prior: position standard deviation across the direction of travel per metre.",
+    0.05, GetParameterManager());
+
+  m_pOdometryPriorFuseHeading = new Parameter<kt_bool>(
+    "OdometryPriorFuseHeading",
+    "Odometry prior also informs heading; off: position only, at the scan's heading.",
+    false, GetParameterManager());
+
+  m_pNearChainMinimumResponseCoarse = new Parameter<kt_double>(
+    "NearChainMinimumResponseCoarse",
+    "Coarse response a gated near-chain match needs (the loop closure's gate is separate).",
+    0.35, GetParameterManager());
+
+  m_pLinkChainScans = new Parameter<kt_int32u>(
+    "LinkChainScans",
+    "A chain match is linked to this many of the chain's closest scans (1: the closest only).",
+    1, GetParameterManager());
+
+  m_pNearChainGated = new Parameter<kt_bool>(
+    "NearChainGated",
+    "Match near chains like loop closures (wide coarse search and the loop-closure gates).",
+    false, GetParameterManager());
+
+  m_pLoopClosureGateDriftYaw = new Parameter<kt_double>(
+    "LoopClosureGateDriftYaw",
+    "Assumed heading drift (rad) per metre of path for the closure gate.",
+    0.01, GetParameterManager());
 }
 /* Adding in getters and setters here for easy parameter access */
 
@@ -2553,6 +3603,90 @@ double Mapper::getParamOccupancyThreshold()
   return static_cast<double>(m_pOccupancyThreshold->GetValue());
 }
 
+bool Mapper::getParamUseReflectors()
+{
+  return static_cast<bool>(m_pUseReflectors->GetValue());
+}
+
+bool Mapper::getParamUseGeometry()
+{
+  return static_cast<bool>(m_pUseGeometry->GetValue());
+}
+
+double Mapper::getParamReflectorWeight()
+{
+  return static_cast<double>(m_pReflectorWeight->GetValue());
+}
+
+double Mapper::getParamReflectorSmearDeviation()
+{
+  return static_cast<double>(m_pReflectorSmearDeviation->GetValue());
+}
+
+double Mapper::getParamReflectorResponseCap()
+{
+  return static_cast<double>(m_pReflectorResponseCap->GetValue());
+}
+
+bool Mapper::getParamReflectorInformationFusion()
+{
+  return static_cast<bool>(m_pReflectorInformationFusion->GetValue());
+}
+
+double Mapper::getParamReflectorCovarianceWindow()
+{
+  return static_cast<double>(m_pReflectorCovarianceWindow->GetValue());
+}
+
+double Mapper::getParamReflectorConsistencyGateChi2()
+{
+  return static_cast<double>(m_pReflectorConsistencyGateChi2->GetValue());
+}
+
+bool Mapper::getParamReflectorFuseHeading()
+{
+  return static_cast<bool>(m_pReflectorFuseHeading->GetValue());
+}
+
+bool Mapper::getParamReflectorsInLoopClosure()
+{
+  return static_cast<bool>(m_pReflectorsInLoopClosure->GetValue());
+}
+bool Mapper::getParamLoopMatchRelativeCovariance()
+{
+  return static_cast<bool>(m_pLoopMatchRelativeCovariance->GetValue());
+}
+
+bool Mapper::getParamLoopClosureCoarseCovariance()
+{
+  return static_cast<bool>(m_pLoopClosureCoarseCovariance->GetValue());
+}
+
+bool Mapper::getParamNearChainGated()
+{
+  return static_cast<bool>(m_pNearChainGated->GetValue());
+}
+
+bool Mapper::getParamLoopClosureMoveScan()
+{
+  return static_cast<bool>(m_pLoopClosureMoveScan->GetValue());
+}
+
+double Mapper::getParamLoopClosureGateChi2()
+{
+  return static_cast<double>(m_pLoopClosureGateChi2->GetValue());
+}
+
+double Mapper::getParamLoopClosureGateDriftXY()
+{
+  return static_cast<double>(m_pLoopClosureGateDriftXY->GetValue());
+}
+
+double Mapper::getParamLoopClosureGateDriftYaw()
+{
+  return static_cast<double>(m_pLoopClosureGateDriftYaw->GetValue());
+}
+
 /* Setters for parameters */
 // General Parameters
 void Mapper::setParamUseScanMatching(bool b)
@@ -2723,6 +3857,145 @@ void Mapper::setParamMinPassThrough(int i)
 void Mapper::setParamOccupancyThreshold(double d)
 {
   m_pOccupancyThreshold->SetValue((kt_double)d);
+}
+
+void Mapper::setParamUseReflectors(bool b)
+{
+  m_pUseReflectors->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamUseGeometry(bool b)
+{
+  m_pUseGeometry->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamReflectorWeight(double d)
+{
+  m_pReflectorWeight->SetValue((kt_double)d);
+}
+
+void Mapper::setParamReflectorSmearDeviation(double d)
+{
+  m_pReflectorSmearDeviation->SetValue((kt_double)d);
+}
+
+void Mapper::setParamReflectorResponseCap(double d)
+{
+  m_pReflectorResponseCap->SetValue((kt_double)d);
+}
+
+void Mapper::setParamReflectorInformationFusion(bool b)
+{
+  m_pReflectorInformationFusion->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamReflectorCovarianceWindow(double d)
+{
+  m_pReflectorCovarianceWindow->SetValue((kt_double)d);
+}
+
+void Mapper::setParamReflectorConsistencyGateChi2(double d)
+{
+  m_pReflectorConsistencyGateChi2->SetValue((kt_double)d);
+}
+
+void Mapper::setParamReflectorFuseHeading(bool b)
+{
+  m_pReflectorFuseHeading->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamReflectorsInLoopClosure(bool b)
+{
+  m_pReflectorsInLoopClosure->SetValue((kt_bool)b);
+}
+void Mapper::setParamLoopMatchRelativeCovariance(bool b)
+{
+  m_pLoopMatchRelativeCovariance->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureCoarseCovariance(bool b)
+{
+  m_pLoopClosureCoarseCovariance->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamOdometryPriorFusion(bool v)
+{
+  m_pOdometryPriorFusion->SetValue((kt_bool)v);
+}
+
+void Mapper::setParamOdometryPriorStddevXyPerMeter(double v)
+{
+  m_pOdometryPriorStddevXyPerMeter->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorStddevXyMin(double v)
+{
+  m_pOdometryPriorStddevXyMin->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorStddevYawPerRadian(double v)
+{
+  m_pOdometryPriorStddevYawPerRadian->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorStddevYawPerMeter(double v)
+{
+  m_pOdometryPriorStddevYawPerMeter->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorStddevYawMin(double v)
+{
+  m_pOdometryPriorStddevYawMin->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorGateChi2(double v)
+{
+  m_pOdometryPriorGateChi2->SetValue((kt_double)v);
+}
+
+void Mapper::setParamOdometryPriorStddevCrossPerMeter(double v)
+{
+  m_pOdometryPriorStddevCrossPerMeter->SetValue(v);
+}
+
+void Mapper::setParamOdometryPriorFuseHeading(bool v)
+{
+  m_pOdometryPriorFuseHeading->SetValue((kt_bool)v);
+}
+
+void Mapper::setParamNearChainMinimumResponseCoarse(double v)
+{
+  m_pNearChainMinimumResponseCoarse->SetValue(v);
+}
+
+void Mapper::setParamLinkChainScans(int n)
+{
+  m_pLinkChainScans->SetValue(static_cast<kt_int32u>(std::max(n, 1)));
+}
+
+void Mapper::setParamNearChainGated(bool b)
+{
+  m_pNearChainGated->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureMoveScan(bool b)
+{
+  m_pLoopClosureMoveScan->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureGateChi2(double d)
+{
+  m_pLoopClosureGateChi2->SetValue((kt_double)d);
+}
+
+void Mapper::setParamLoopClosureGateDriftXY(double d)
+{
+  m_pLoopClosureGateDriftXY->SetValue((kt_double)d);
+}
+
+void Mapper::setParamLoopClosureGateDriftYaw(double d)
+{
+  m_pLoopClosureGateDriftYaw->SetValue((kt_double)d);
 }
 
 

@@ -67,12 +67,24 @@ public:
   const;
   // Get the frozen nominal offset each sensor's extrinsic prior was anchored to
   virtual const std::unordered_map<std::string, karto::Pose2> & GetSensorNominalOffsets() const;
+  // Seed or reset the extrinsic estimate (see karto::ScanSolver)
+  virtual kt_bool SetSensorOffsetCorrection(const karto::Pose2 & correction);
+  virtual kt_bool InitializeSensorOffset(
+    const std::string & sensorName, const karto::Pose2 & nominal, karto::Pose2 & estimate);
+  // Freeze or unfreeze the extrinsic estimate (see karto::ScanSolver)
+  virtual kt_bool SetSensorOffsetEstimation(
+    karto::ScanSolver::SensorOffsetComponent component, kt_bool estimate);
+  virtual kt_bool GetSensorOffsetEstimation(
+    karto::ScanSolver::SensorOffsetComponent component) const;
 
 private:
   // Lazily create (on first sight of a sensor name) the live extrinsic parameter block for
   // that sensor, anchored to its nominal (TF-derived) offset with a Gaussian prior residual.
   // Caller must hold nodes_mutex_.
   void GetOrCreateSensorOffset(const std::string & sensorName, const karto::Pose2 & nominalOffset);
+  // nominal * correction, each component within extrinsic_max_correction_* of the nominal.
+  karto::Pose2 ClampedSensorOffset(
+    const karto::Pose2 & nominal, const karto::Pose2 & correction) const;
   // karto
   karto::ScanSolver::IdPoseVector corrections_;
 
@@ -100,14 +112,29 @@ private:
   std::unordered_map<std::string, Eigen::Matrix3d> * sensor_offset_covariances_;
   std::unordered_map<std::string, karto::Pose2> sensor_offset_corrections_;
   // Frozen nominal offset each sensor's prior was anchored to, set once in
-  // GetOrCreateSensorOffset and never updated -- used to publish a residual-vs-nominal debug
-  // view instead of the raw base_link-frame estimate.
+  // GetOrCreateSensorOffset and never updated -- not by Reset() either: it is the TF mount, not
+  // a result. Also what extrinsic_max_correction_* bound the estimate around.
   std::unordered_map<std::string, karto::Pose2> sensor_nominal_offsets_;
+  // Correction a new sensor offset starts from (sensor_extrinsic_seed, or the last
+  // SetSensorOffsetCorrection), nominal^-1 * estimate.
+  karto::Pose2 sensor_offset_seed_;
+  double extrinsic_max_correction_xy_, extrinsic_max_correction_yaw_;
+  // Whether solves update the extrinsic's x/y and its yaw (estimate_sensor_extrinsic_xy, _yaw);
+  // a component that is off has constant parameter blocks. Guarded by nodes_mutex_.
+  bool estimate_sensor_extrinsic_xy_, estimate_sensor_extrinsic_yaw_;
+  // Makes each of the x, y and yaw blocks constant or variable per the flags above.
+  void ApplySensorOffsetFreedom(Eigen::Vector3d & offset);
   bool optimize_sensor_extrinsics_;
+  bool odometry_edge_midpoint_{false};
+  // The odometry edge's residual: start-pose frame, or midpoint frame (odometry_edge_midpoint).
+  ceres::CostFunction * OdometryCostFunction(
+    double x, double y, double yaw, const Eigen::Matrix3d & sqrt_information) const;
   double extrinsic_prior_stddev_xy_, extrinsic_prior_stddev_yaw_;
   // Independent robot-frame (odometry) residual added alongside the sensor-frame one -- this is
   // what actually makes the extrinsic identifiable (AX=XB); see PLAN.md addendum.
   double odometry_edge_stddev_xy_, odometry_edge_stddev_yaw_;
+  // Add the odometry residual to sequential edges without extrinsic calibration as well.
+  bool use_odometry_edges_;
 
   // ros
   rclcpp::Node::SharedPtr node_;

@@ -19,6 +19,7 @@
 #ifndef SLAM_TOOLBOX__LASER_UTILS_HPP_
 #define SLAM_TOOLBOX__LASER_UTILS_HPP_
 
+#include <algorithm>
 #include <string>
 #include <memory>
 #include <map>
@@ -53,6 +54,28 @@ inline std::vector<double> scanToReadings(
   }
 
   return readings;
+}
+
+// Reflector weight per reading, in the same order as scanToReadings: the scan's
+// intensities clamped to [0, 1]. scan_node writes 1 on the centre beam of each
+// confirmed reflector marker and 0 elsewhere (REFLECTOR_SLAM.md). Empty when the
+// scan has no intensity per range.
+inline std::vector<double> scanToReflectorWeights(
+  const sensor_msgs::msg::LaserScan & scan,
+  const bool & inverted)
+{
+  std::vector<double> weights;
+  if (scan.intensities.size() != scan.ranges.size()) {
+    return weights;
+  }
+  weights.reserve(scan.intensities.size());
+  for (const float intensity : scan.intensities) {
+    weights.push_back(std::clamp(static_cast<double>(intensity), 0.0, 1.0));
+  }
+  if (inverted) {
+    std::reverse(weights.begin(), weights.end());
+  }
+  return weights;
 }
 
 // Store laser scanner information

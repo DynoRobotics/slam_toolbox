@@ -34,6 +34,7 @@
 #include <boost/archive/binary_oarchive.hpp>
 #include <boost/serialization/map.hpp>
 #include <boost/serialization/vector.hpp>
+#include <boost/serialization/version.hpp>
 #include <boost/serialization/string.hpp>
 #include <boost/serialization/array.hpp>
 #include <boost/version.hpp>
@@ -5636,6 +5637,52 @@ public:
     }
   }
 
+  /**
+   * Sets the reflector weight of every range reading, in the order of the readings: 0 for
+   * none, (0, 1] for a reflector marker (REFLECTOR_SLAM.md). Empty means the scan has no
+   * reflector data.
+   */
+  inline void SetReflectorWeights(const std::vector<kt_double> & rWeights)
+  {
+    m_ReflectorWeights = rWeights;
+    m_IsDirty = true;
+  }
+
+  inline const std::vector<kt_double> & GetReflectorWeights() const
+  {
+    return m_ReflectorWeights;
+  }
+
+  /**
+   * Reflector points in world coordinates: the filtered point readings whose reflector
+   * weight is above 0. Parallel to GetReflectorPointWeights().
+   */
+  inline const PointVectorDouble & GetReflectorPoints() const
+  {
+    std::shared_lock<std::shared_mutex> lock(m_Lock);
+    if (m_IsDirty) {
+      // throw away constness and do an update!
+      lock.unlock();
+      std::unique_lock<std::shared_mutex> uniqueLock(m_Lock);
+      const_cast<LocalizedRangeScan *>(this)->Update();
+    }
+
+    return m_ReflectorPoints;
+  }
+
+  inline const std::vector<kt_double> & GetReflectorPointWeights() const
+  {
+    std::shared_lock<std::shared_mutex> lock(m_Lock);
+    if (m_IsDirty) {
+      // throw away constness and do an update!
+      lock.unlock();
+      std::unique_lock<std::shared_mutex> uniqueLock(m_Lock);
+      const_cast<LocalizedRangeScan *>(this)->Update();
+    }
+
+    return m_ReflectorPointWeights;
+  }
+
 private:
   /**
    * Compute point readings based on range readings
@@ -5648,6 +5695,8 @@ private:
     if (pLaserRangeFinder != NULL) {
       m_PointReadings.clear();
       m_UnfilteredPointReadings.clear();
+      m_ReflectorPoints.clear();
+      m_ReflectorPointWeights.clear();
 
       kt_double rangeThreshold = pLaserRangeFinder->GetRangeThreshold();
       kt_double minimumAngle = pLaserRangeFinder->GetMinimumAngle();
@@ -5678,6 +5727,10 @@ private:
 
         m_PointReadings.push_back(point);
         m_UnfilteredPointReadings.push_back(point);
+        if (i < m_ReflectorWeights.size() && m_ReflectorWeights[i] > 0.0) {
+          m_ReflectorPoints.push_back(point);
+          m_ReflectorPointWeights.push_back(m_ReflectorWeights[i]);
+        }
 
         rangePointsSum += point;
       }
@@ -5718,6 +5771,12 @@ private:
     ar & BOOST_SERIALIZATION_NVP(m_BoundingBox);
     ar & BOOST_SERIALIZATION_NVP(m_IsDirty);
     ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(LaserRangeScan);
+    // Version 1 adds reflector data; pose graphs saved before load with none.
+    if (version >= 1) {
+      ar & BOOST_SERIALIZATION_NVP(m_ReflectorWeights);
+      ar & BOOST_SERIALIZATION_NVP(m_ReflectorPoints);
+      ar & BOOST_SERIALIZATION_NVP(m_ReflectorPointWeights);
+    }
   }
 
 private:
@@ -5760,6 +5819,17 @@ protected:
    * Internal flag used to update point readings, barycenter and bounding box
    */
   kt_bool m_IsDirty;
+
+  /**
+   * Reflector weight per range reading (empty: no reflector data)
+   */
+  std::vector<kt_double> m_ReflectorWeights;
+
+  /**
+   * Filtered point readings with a reflector weight above 0, and their weights
+   */
+  PointVectorDouble m_ReflectorPoints;
+  std::vector<kt_double> m_ReflectorPointWeights;
 };    // LocalizedRangeScan
 
 /**
@@ -7018,6 +7088,8 @@ BOOST_CLASS_EXPORT_KEY(karto::Sensor);
 BOOST_CLASS_EXPORT_KEY(karto::Name);
 BOOST_CLASS_EXPORT_KEY(karto::SensorData);
 BOOST_CLASS_EXPORT_KEY(karto::LocalizedRangeScan);
+// 1: reflector weights and points (REFLECTOR_SLAM.md).
+BOOST_CLASS_VERSION(karto::LocalizedRangeScan, 1);
 BOOST_CLASS_EXPORT_KEY(karto::LaserRangeScan);
 BOOST_CLASS_EXPORT_KEY(karto::LaserRangeFinder);
 BOOST_CLASS_EXPORT_KEY(karto::CustomData);

@@ -3,6 +3,7 @@
  * Author: Steve Macenski (stevenmacenski@gmail.com)
  */
 
+#include <algorithm>
 #include <unordered_map>
 #include <string>
 #include <utility>
@@ -51,10 +52,29 @@ void CeresSolver::Configure(rclcpp::Node::SharedPtr node)
     "extrinsic_prior_stddev_xy", 0.02);
   extrinsic_prior_stddev_yaw_ = node->declare_parameter(
     "extrinsic_prior_stddev_yaw", 0.02);
+  // Hard limits on how far the estimate may move from the nominal (TF) mount, per component:
+  // Ceres bounds, so the calibration can never run off, and the clamp on seeds.
+  // optimize_sensor_extrinsics puts the extrinsic into the graph (a calibrated mount, seedable);
+  // these decide whether solves keep learning its x/y and its yaw or leave them as they are.
+  // x/y are only observable through turns between nodes, yaw also from straight driving.
+  estimate_sensor_extrinsic_xy_ = node->declare_parameter("estimate_sensor_extrinsic_xy", true);
+  estimate_sensor_extrinsic_yaw_ =
+    node->declare_parameter("estimate_sensor_extrinsic_yaw", true);
+  extrinsic_max_correction_xy_ = node->declare_parameter(
+    "extrinsic_max_correction_xy", 0.05);
+  extrinsic_max_correction_yaw_ = node->declare_parameter(
+    "extrinsic_max_correction_yaw", 0.035);
   odometry_edge_stddev_xy_ = node->declare_parameter(
     "odometry_edge_stddev_xy", 0.03);
   odometry_edge_stddev_yaw_ = node->declare_parameter(
     "odometry_edge_stddev_yaw", 0.02);
+  // Without extrinsic calibration the graph otherwise holds only scan-match edges, so good
+  // wheel+IMU odometry has no say and the periodic solve has nothing to correct
+  // (REFLECTOR_SLAM.md §5.5, §7.1).
+  use_odometry_edges_ = node->declare_parameter("use_odometry_edges", false);
+  // Compare odometry edges' translation in the edge's midpoint frame (OdometryMidpointErrorTerm):
+  // a turn-rate error in odometry then no longer biases the direction, nor the calibrated yaw.
+  odometry_edge_midpoint_ = node->declare_parameter("odometry_edge_midpoint", false);
 
   corrections_.clear();
   first_node_ = nodes_->end();
@@ -256,14 +276,36 @@ void CeresSolver::Compute()
         karto::Pose2(kv.second(0), kv.second(1), kv.second(2));
     }
 
+    // Over the learned components only (constant blocks have no covariance): a frozen one gets
+    // variance 0, and a fully frozen estimate keeps the covariance it was last learned with.
+    std::vector<int> free;
+    if (estimate_sensor_extrinsic_xy_) {
+      free = {0, 1};
+    }
+    if (estimate_sensor_extrinsic_yaw_) {
+      free.push_back(2);
+    }
     ceres::Covariance::Options cov_options;
     for (auto & kv : *sensor_offsets_) {
+      if (free.empty()) {
+        break;
+      }
       Eigen::Vector3d & ext = kv.second;
-      std::vector<const double *> blocks = {&ext(0), &ext(1), &ext(2)};
+      std::vector<const double *> blocks;
+      for (const int i : free) {
+        blocks.push_back(&ext(i));
+      }
       ceres::Covariance covariance(cov_options);
       if (covariance.Compute(blocks, problem_)) {
-        Eigen::Matrix<double, 3, 3, Eigen::RowMajor> cov;
-        if (covariance.GetCovarianceMatrix(blocks, cov.data())) {
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> part(
+          free.size(), free.size());
+        if (covariance.GetCovarianceMatrix(blocks, part.data())) {
+          Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+          for (size_t a = 0; a < free.size(); ++a) {
+            for (size_t b = 0; b < free.size(); ++b) {
+              cov(free[a], free[b]) = part(a, b);
+            }
+          }
           (*sensor_offset_covariances_)[kv.first] = cov;
         }
       } else {
@@ -330,7 +372,6 @@ void CeresSolver::Reset()
   sensor_offsets_initialized_ = new std::unordered_set<std::string>();
   sensor_offset_covariances_ = new std::unordered_map<std::string, Eigen::Matrix3d>();
   sensor_offset_corrections_.clear();
-  sensor_nominal_offsets_.clear();
   problem_ = new ceres::Problem(options_problem_);
   first_node_ = nodes_->end();
 
@@ -369,21 +410,158 @@ void CeresSolver::GetOrCreateSensorOffset(
     return;
   }
 
-  Eigen::Vector3d offset(nominalOffset.GetX(), nominalOffset.GetY(), nominalOffset.GetHeading());
-  (*sensor_offsets_)[sensorName] = offset;
+  // The laser's offset is the nominal only until the first solve feeds the estimate back
+  // (MapperGraph::CorrectPoses), so a sensor seen before (InitializeSensorOffset, or before a
+  // Reset) keeps the nominal it was first given.
+  const karto::Pose2 nominal =
+    sensor_nominal_offsets_.emplace(sensorName, nominalOffset).first->second;
+  const karto::Pose2 start = ClampedSensorOffset(nominal, sensor_offset_seed_);
+  (*sensor_offsets_)[sensorName] =
+    Eigen::Vector3d(start.GetX(), start.GetY(), start.GetHeading());
   Eigen::Vector3d & ref = (*sensor_offsets_)[sensorName];
-  sensor_nominal_offsets_[sensorName] = nominalOffset;
+  sensor_offset_corrections_[sensorName] = start;
+  RCLCPP_INFO(node_->get_logger(),
+    "CeresSolver: extrinsic of '%s' starts at x %.4f y %.4f yaw %.3f deg (nominal x %.4f y %.4f "
+    "yaw %.3f deg), x/y %s, yaw %s", sensorName.c_str(), start.GetX(), start.GetY(),
+    start.GetHeading() * 180.0 / M_PI, nominal.GetX(), nominal.GetY(),
+    nominal.GetHeading() * 180.0 / M_PI, estimate_sensor_extrinsic_xy_ ? "learned" : "fixed",
+    estimate_sensor_extrinsic_yaw_ ? "learned" : "fixed");
 
   // AddResidualBlock is what implicitly creates the (x_e, y_e, yaw_e) parameter blocks in the
   // Ceres problem -- SetParameterization must come after, not before, or Ceres doesn't know
-  // about the block yet.
+  // about the block yet. The prior stays on the nominal, whatever the start: its stddev is the
+  // mount's tolerance, and a bad seed must not pull the estimate for good.
   ceres::CostFunction * prior = ExtrinsicPriorErrorTerm::Create(
-    ref(0), ref(1), ref(2), extrinsic_prior_stddev_xy_, extrinsic_prior_stddev_yaw_);
+    nominal.GetX(), nominal.GetY(), nominal.GetHeading(), extrinsic_prior_stddev_xy_,
+    extrinsic_prior_stddev_yaw_);
   problem_->AddResidualBlock(prior, nullptr /* no robust loss on the prior */,
     &ref(0), &ref(1), &ref(2));
   problem_->SetParameterization(&ref(2), angle_local_parameterization_);
+  ApplySensorOffsetFreedom(ref);
+
+  problem_->SetParameterLowerBound(&ref(0), 0, nominal.GetX() - extrinsic_max_correction_xy_);
+  problem_->SetParameterUpperBound(&ref(0), 0, nominal.GetX() + extrinsic_max_correction_xy_);
+  problem_->SetParameterLowerBound(&ref(1), 0, nominal.GetY() - extrinsic_max_correction_xy_);
+  problem_->SetParameterUpperBound(&ref(1), 0, nominal.GetY() + extrinsic_max_correction_xy_);
+  // The yaw parameterization wraps at +-pi, so a yaw box only works when it does not reach it.
+  if (std::abs(nominal.GetHeading()) + extrinsic_max_correction_yaw_ < M_PI) {
+    problem_->SetParameterLowerBound(
+      &ref(2), 0, nominal.GetHeading() - extrinsic_max_correction_yaw_);
+    problem_->SetParameterUpperBound(
+      &ref(2), 0, nominal.GetHeading() + extrinsic_max_correction_yaw_);
+  } else {
+    RCLCPP_WARN(node_->get_logger(),
+      "CeresSolver: nominal lidar yaw %.3f is within extrinsic_max_correction_yaw of +-pi; "
+      "the extrinsic yaw is not bounded.", nominal.GetHeading());
+  }
 
   sensor_offsets_initialized_->insert(sensorName);
+}
+
+/*****************************************************************************/
+karto::Pose2 CeresSolver::ClampedSensorOffset(
+  const karto::Pose2 & nominal, const karto::Pose2 & correction) const
+/*****************************************************************************/
+{
+  const karto::Pose2 offset = karto::Transform(nominal).TransformPose(correction);
+  const double max_xy = extrinsic_max_correction_xy_;
+  const double max_yaw = extrinsic_max_correction_yaw_;
+  return karto::Pose2(
+    nominal.GetX() + std::clamp(offset.GetX() - nominal.GetX(), -max_xy, max_xy),
+    nominal.GetY() + std::clamp(offset.GetY() - nominal.GetY(), -max_xy, max_xy),
+    karto::math::NormalizeAngle(nominal.GetHeading() + std::clamp(
+      karto::math::NormalizeAngle(offset.GetHeading() - nominal.GetHeading()), -max_yaw,
+      max_yaw)));
+}
+
+/*****************************************************************************/
+kt_bool CeresSolver::SetSensorOffsetCorrection(const karto::Pose2 & correction)
+/*****************************************************************************/
+{
+  boost::mutex::scoped_lock lock(nodes_mutex_);
+  sensor_offset_seed_ = correction;
+  if (!optimize_sensor_extrinsics_) {
+    return false;
+  }
+  kt_bool changed = false;
+  for (auto & kv : *sensor_offsets_) {
+    const karto::Pose2 offset =
+      ClampedSensorOffset(sensor_nominal_offsets_.at(kv.first), correction);
+    kv.second = Eigen::Vector3d(offset.GetX(), offset.GetY(), offset.GetHeading());
+    sensor_offset_corrections_[kv.first] = offset;
+    // computed for the old estimate; the next solve recomputes it
+    sensor_offset_covariances_->erase(kv.first);
+    changed = true;
+  }
+  return changed;
+}
+
+/*****************************************************************************/
+kt_bool CeresSolver::SetSensorOffsetEstimation(
+  karto::ScanSolver::SensorOffsetComponent component, kt_bool estimate)
+/*****************************************************************************/
+{
+  if (!optimize_sensor_extrinsics_) {
+    return false;
+  }
+  boost::mutex::scoped_lock lock(nodes_mutex_);
+  (component == SensorOffsetXY ? estimate_sensor_extrinsic_xy_ : estimate_sensor_extrinsic_yaw_) =
+    estimate;
+  for (auto & kv : *sensor_offsets_) {
+    ApplySensorOffsetFreedom(kv.second);
+  }
+  return true;
+}
+
+/*****************************************************************************/
+kt_bool CeresSolver::GetSensorOffsetEstimation(
+  karto::ScanSolver::SensorOffsetComponent component) const
+/*****************************************************************************/
+{
+  return optimize_sensor_extrinsics_ &&
+         (component == SensorOffsetXY ? estimate_sensor_extrinsic_xy_ :
+         estimate_sensor_extrinsic_yaw_);
+}
+
+/*****************************************************************************/
+void CeresSolver::ApplySensorOffsetFreedom(Eigen::Vector3d & offset)
+/*****************************************************************************/
+{
+  // caller holds nodes_mutex_
+  const bool free[3] = {
+    estimate_sensor_extrinsic_xy_, estimate_sensor_extrinsic_xy_, estimate_sensor_extrinsic_yaw_};
+  for (int i = 0; i < 3; ++i) {
+    if (free[i]) {
+      problem_->SetParameterBlockVariable(&offset(i));
+    } else {
+      problem_->SetParameterBlockConstant(&offset(i));
+    }
+  }
+}
+
+/*****************************************************************************/
+kt_bool CeresSolver::InitializeSensorOffset(
+  const std::string & sensorName, const karto::Pose2 & nominal, karto::Pose2 & estimate)
+/*****************************************************************************/
+{
+  if (!optimize_sensor_extrinsics_) {
+    return false;
+  }
+  boost::mutex::scoped_lock lock(nodes_mutex_);
+  GetOrCreateSensorOffset(sensorName, nominal);
+  estimate = sensor_offset_corrections_.at(sensorName);
+  return true;
+}
+
+/*****************************************************************************/
+ceres::CostFunction * CeresSolver::OdometryCostFunction(
+  double x, double y, double yaw, const Eigen::Matrix3d & sqrt_information) const
+/*****************************************************************************/
+{
+  if (odometry_edge_midpoint_) {
+    return OdometryMidpointErrorTerm::Create(x, y, yaw, sqrt_information);
+  }
+  return PoseGraph2dErrorTerm::Create(x, y, yaw, sqrt_information);
 }
 
 /*****************************************************************************/
@@ -465,7 +643,7 @@ void CeresSolver::AddConstraint(karto::Edge<karto::LocalizedRangeScan> * pEdge)
       odom_sqrt_information(1, 1) = 1.0 / odometry_edge_stddev_xy_;
       odom_sqrt_information(2, 2) = 1.0 / odometry_edge_stddev_yaw_;
 
-      ceres::CostFunction * odom_cost_function = PoseGraph2dErrorTerm::Create(
+      ceres::CostFunction * odom_cost_function = OdometryCostFunction(
         opose2d(0), opose2d(1), opose2d(2), odom_sqrt_information);
       edge_blocks.push_back(problem_->AddResidualBlock(
         odom_cost_function, loss_function_,
@@ -501,6 +679,22 @@ void CeresSolver::AddConstraint(karto::Edge<karto::LocalizedRangeScan> * pEdge)
       angle_local_parameterization_);
     problem_->SetParameterization(&node2it->second(2),
       angle_local_parameterization_);
+
+    // Independent robot-frame odometry measurement, as in the extrinsic path above; Karto
+    // attaches it to sequential edges only.
+    if (use_odometry_edges_ && pLinkInfo->HasOdomFrameData()) {
+      karto::Pose2 odiff = pLinkInfo->GetOdomPoseDifference();
+      Eigen::Matrix3d odom_sqrt_information = Eigen::Matrix3d::Zero();
+      odom_sqrt_information(0, 0) = 1.0 / odometry_edge_stddev_xy_;
+      odom_sqrt_information(1, 1) = 1.0 / odometry_edge_stddev_xy_;
+      odom_sqrt_information(2, 2) = 1.0 / odometry_edge_stddev_yaw_;
+      ceres::CostFunction * odom_cost_function = OdometryCostFunction(
+        odiff.GetX(), odiff.GetY(), odiff.GetHeading(), odom_sqrt_information);
+      edge_blocks.push_back(problem_->AddResidualBlock(
+        odom_cost_function, loss_function_,
+        &node1it->second(0), &node1it->second(1), &node1it->second(2),
+        &node2it->second(0), &node2it->second(1), &node2it->second(2)));
+    }
   }
 
   blocks_->insert(std::pair<std::size_t, std::vector<ceres::ResidualBlockId>>(

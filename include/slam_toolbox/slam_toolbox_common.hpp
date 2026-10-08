@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <memory>
 #include <fstream>
+#include <optional>
 
 #include "rclcpp/rclcpp.hpp"
 #include "message_filters/subscriber.h"
@@ -38,6 +39,9 @@
 #include "tf2/LinearMath/Matrix3x3.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/empty.hpp"
 
 #include "pluginlib/class_loader.hpp"
 
@@ -100,6 +104,9 @@ protected:
     karto::Pose2 & karto_pose);
   karto::LocalizedRangeScan * addScan(karto::LaserRangeFinder * laser, PosedScan & scanWPose);
   bool updateMap();
+  // Applies pending_extrinsic_seed_ to the solver once the laser exists. Caller holds
+  // smapper_mutex_.
+  void applyExtrinsicSeed();
   tf2::Stamped<tf2::Transform> setTransformFromPoses(
     const karto::Pose2 & pose,
     const karto::Pose2 & karto_pose, const rclcpp::Time & t,
@@ -139,10 +146,17 @@ protected:
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::Pause>> ssPauseMeasurements_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::SerializePoseGraph>> ssSerialize_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::DeserializePoseGraph>> ssDesserialize_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr extrinsic_seed_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr extrinsic_reset_sub_;
+  // per extrinsic component (x/y, yaw)
+  std::vector<rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr> extrinsic_estimate_subs_;
+  std::vector<rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr> extrinsic_estimating_pubs_;
+  std::vector<rclcpp::TimerBase::SharedPtr> extrinsic_estimating_timers_;
 
   // Storage for ROS parameters
   std::string odom_frame_, map_frame_, base_frame_, map_name_, scan_topic_;
   bool use_map_saver_;
+  bool use_reflectors_;
   rclcpp::Duration transform_timeout_;
   std_msgs::msg::Header scan_header;
   int throttle_scans_, scan_queue_size_;
@@ -178,6 +192,11 @@ protected:
   ProcessType processor_type_;
   std::unique_ptr<karto::Pose2> process_near_pose_;
   tf2::Transform reprocessing_transform_;
+  // Lidar extrinsic correction (lidar_frame, see LoopClosureAssistant) not yet given to the
+  // solver, and whether the seed topic already delivered its one message. Guarded by
+  // smapper_mutex_.
+  std::optional<geometry_msgs::msg::Pose> pending_extrinsic_seed_;
+  bool extrinsic_seed_received_ = false;
 
   // pluginlib
   pluginlib::ClassLoader<karto::ScanSolver> solver_loader_;

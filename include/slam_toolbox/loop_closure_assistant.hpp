@@ -27,6 +27,7 @@
 #include <unordered_map>
 
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2/utils.h"
@@ -57,6 +58,16 @@ public:
     const visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr feedback);
   void publishGraph();
   void setMapper(karto::Mapper * mapper);
+  // Publishes the solver's extrinsic estimate as a correction of the nominal in lidar_frame
+  // (slam_toolbox/sensor_extrinsic_calibration) and as lidar_frame -> calibrated_lidar_frame.
+  // Caller holds the mapper's mutex.
+  void updateExtrinsicCalibration();
+  // A correction in lidar_frame (as published) to the solver's (karto sensor frame). False
+  // until the lidar's TF is known.
+  bool toSolverCorrection(
+    const geometry_msgs::msg::Pose & lidar_correction, karto::Pose2 & correction);
+  // The other way: a solver correction (nominal^-1 * estimate) in lidar_frame.
+  geometry_msgs::msg::Pose toLidarFrame(const karto::Pose2 & correction);
 
 private:
   bool manualLoopClosureCallback(
@@ -76,8 +87,10 @@ private:
   void addMovedNodes(const int& id, Eigen::Vector3d vec);
   void publishExtrinsicCalibration();
   bool isLidarFrameInverted();
+  void broadcastCalibratedLidarFrame();
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tfB_;
+  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
   tf2_ros::Buffer * tf_;
   laser_utils::ScanHolder * scan_holder_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
@@ -98,6 +111,8 @@ private:
   std::string map_frame_;
   std::string base_frame_;
   std::string lidar_frame_;
+  std::string calibrated_lidar_frame_;
+  geometry_msgs::msg::Pose calibrated_lidar_pose_;  // last broadcast; guarded by extrinsic_mutex_
   bool lidar_frame_inversion_checked_ = false;
   bool lidar_frame_inverted_ = false;
   boost::mutex extrinsic_mutex_;

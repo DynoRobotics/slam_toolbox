@@ -165,6 +165,14 @@ target_link_libraries(localization_slam_toolbox toolbox_common kartoSlamToolbox 
 add_executable(localization_slam_toolbox_node src/slam_toolbox_localization_node.cpp)
 target_link_libraries(localization_slam_toolbox_node localization_slam_toolbox)
 
+#### Deterministic offline bag replay (REFLECTOR_SLAM.md)
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
+find_package(tf2_msgs REQUIRED)
+add_executable(offline_replay src/experimental/offline_replay.cpp)
+ament_target_dependencies(offline_replay rosbag2_cpp rosbag2_storage tf2_msgs)
+target_link_libraries(offline_replay toolbox_common kartoSlamToolbox ${Boost_LIBRARIES})
+
 add_library(lifelong_slam_toolbox src/experimental/slam_toolbox_lifelong.cpp)
 target_link_libraries(lifelong_slam_toolbox toolbox_common kartoSlamToolbox ${Boost_LIBRARIES})
 add_executable(lifelong_slam_toolbox_node src/experimental/slam_toolbox_lifelong_node.cpp)
@@ -188,6 +196,9 @@ if(BUILD_TESTING)
   ament_add_gtest(lifelong_metrics_test test/lifelong_metrics_test.cpp)
   target_link_libraries(lifelong_metrics_test lifelong_slam_toolbox)
 
+  ament_add_gtest(reflector_scan_test test/reflector_scan_test.cpp)
+  target_link_libraries(reflector_scan_test kartoSlamToolbox)
+
   ament_add_gtest(ceres_extrinsic_test test/ceres_extrinsic_test.cpp)
   ament_target_dependencies(ceres_extrinsic_test ${dependencies})
   target_link_libraries(ceres_extrinsic_test ceres_solver_plugin kartoSlamToolbox
@@ -203,6 +214,7 @@ rclcpp_components_register_nodes(map_and_localization_slam_toolbox "slam_toolbox
 #### Install
 install(TARGETS async_slam_toolbox_node
                 sync_slam_toolbox_node
+                offline_replay
                 localization_slam_toolbox_node
                 map_and_localization_slam_toolbox_node
                 merge_maps_kinematic

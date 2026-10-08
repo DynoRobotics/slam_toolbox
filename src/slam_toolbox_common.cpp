@@ -20,6 +20,8 @@
 #include <vector>
 #include <string>
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
 #include "slam_toolbox/slam_toolbox_common.hpp"
 #include "slam_toolbox/serialization.hpp"
 
@@ -71,6 +73,77 @@ void SlamToolbox::configure()
     shared_from_this(), smapper_->getMapper(), scan_holder_.get(),
     state_, processor_type_, tf_.get());
   reprocessing_transform_.setIdentity();
+
+  // Lidar extrinsic calibration seed and reset (optimize_sensor_extrinsics), each a correction
+  // of the nominal TF mount expressed in lidar_frame, as published on
+  // slam_toolbox/sensor_extrinsic_calibration. The parameter is the initial seed; the first
+  // message on the latched seed topic (a persisted calibration) replaces it, later ones are
+  // ignored so they never fight the live estimate. A reset sets the estimate back to the nominal.
+  // Either one arriving after mapping started moves the estimate in place; the next solve
+  // starts from there.
+  const std::vector<double> seed = this->declare_parameter(
+    "sensor_extrinsic_seed", std::vector<double>{0.0, 0.0, 0.0});
+  if (seed.size() != 3) {
+    throw std::runtime_error("sensor_extrinsic_seed must be [x, y, yaw]");
+  }
+  geometry_msgs::msg::Pose seed_pose;
+  seed_pose.position.x = seed[0];
+  seed_pose.position.y = seed[1];
+  seed_pose.orientation.z = std::sin(seed[2] / 2.0);
+  seed_pose.orientation.w = std::cos(seed[2] / 2.0);
+  pending_extrinsic_seed_ = seed_pose;
+  extrinsic_seed_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+    "slam_toolbox/sensor_extrinsic_seed", rclcpp::QoS(1).transient_local(),
+    [this](const geometry_msgs::msg::PoseStamped & msg) {
+      boost::mutex::scoped_lock lock(smapper_mutex_);
+      if (extrinsic_seed_received_) {
+        return;
+      }
+      extrinsic_seed_received_ = true;
+      pending_extrinsic_seed_ = msg.pose;
+      applyExtrinsicSeed();
+    });
+  // Whether the extrinsic's x/y and its yaw keep being learned (estimate_sensor_extrinsic_xy,
+  // _yaw, then the latest message on each latched request topic) or stay as they are; they are
+  // used either way. Each state is latched and republished every second.
+  for (const auto & [component, suffix] : {
+      std::pair{karto::ScanSolver::SensorOffsetXY, "xy"},
+      std::pair{karto::ScanSolver::SensorOffsetYaw, "yaw"}})
+  {
+    auto pub = this->create_publisher<std_msgs::msg::Bool>(
+      std::string("slam_toolbox/sensor_extrinsic_estimating_") + suffix,
+      rclcpp::QoS(1).transient_local());
+    const auto publish_estimating = [this, pub, component = component] {
+        std_msgs::msg::Bool msg;
+        msg.data = solver_->GetSensorOffsetEstimation(component);
+        pub->publish(msg);
+      };
+    extrinsic_estimating_pubs_.push_back(pub);
+    extrinsic_estimate_subs_.push_back(this->create_subscription<std_msgs::msg::Bool>(
+        std::string("slam_toolbox/sensor_extrinsic_estimate_") + suffix,
+        rclcpp::QoS(1).transient_local(),
+        [this, publish_estimating, component = component, name = std::string(suffix)](
+          const std_msgs::msg::Bool & msg) {
+          boost::mutex::scoped_lock lock(smapper_mutex_);
+          if (solver_->SetSensorOffsetEstimation(component, msg.data)) {
+            RCLCPP_INFO(get_logger(), "Lidar extrinsic %s estimation %s", name.c_str(),
+              msg.data ? "on" : "off");
+          } else {
+            RCLCPP_WARN(get_logger(), "Lidar extrinsic %s estimation request ignored: "
+              "optimize_sensor_extrinsics is off", name.c_str());
+          }
+          publish_estimating();
+        }));
+    extrinsic_estimating_timers_.push_back(
+      this->create_wall_timer(std::chrono::seconds(1), publish_estimating));
+  }
+  extrinsic_reset_sub_ = this->create_subscription<std_msgs::msg::Empty>(
+    "slam_toolbox/sensor_extrinsic_reset", 10, [this](const std_msgs::msg::Empty &) {
+      RCLCPP_INFO(get_logger(), "Resetting the lidar extrinsic estimate to the nominal mount");
+      boost::mutex::scoped_lock lock(smapper_mutex_);
+      pending_extrinsic_seed_ = geometry_msgs::msg::Pose();
+      applyExtrinsicSeed();
+    });
 
   double transform_publish_period = 0.05;
   transform_publish_period =
@@ -152,6 +225,14 @@ void SlamToolbox::setParams()
 
   scan_topic_ = std::string("/scan");
   scan_topic_ = this->declare_parameter("scan_topic", scan_topic_);
+
+  // Read the scan's intensities as reflector marker weights (REFLECTOR_SLAM.md).
+  // Also declared by SMapper::configure, which reads it for matching.
+  use_reflectors_ = false;
+  if (!this->has_parameter("use_reflectors")) {
+    this->declare_parameter("use_reflectors", use_reflectors_);
+  }
+  this->get_parameter("use_reflectors", use_reflectors_);
 
   scan_queue_size_ = 1.0;
   scan_queue_size_ = this->declare_parameter("scan_queue_size", scan_queue_size_);
@@ -374,6 +455,7 @@ LaserRangeFinder * SlamToolbox::getLaser(
 {
   const std::string & frame = scan->header.frame_id;
   if (lasers_.find(frame) == lasers_.end()) {
+    boost::mutex::scoped_lock lock(smapper_mutex_);
     try {
       lasers_[frame] = laser_assistant_->toLaserMetadata(*scan);
       dataset_->Add(lasers_[frame].getLaser(), true);
@@ -382,9 +464,38 @@ LaserRangeFinder * SlamToolbox::getLaser(
         "aborting initialization (%s)", e.what());
       return nullptr;
     }
+    // Start the extrinsic estimate from the seed right away, so the very first scans use it.
+    applyExtrinsicSeed();
+    LaserRangeFinder * laser = lasers_[frame].getLaser();
+    Pose2 estimate;
+    if (solver_->InitializeSensorOffset(
+        laser->GetName().ToString(), laser->GetOffsetPose(), estimate))
+    {
+      laser->SetOffsetPose(estimate);
+    }
+    closure_assistant_->updateExtrinsicCalibration();
   }
 
   return lasers_[frame].getLaser();
+}
+
+/*****************************************************************************/
+void SlamToolbox::applyExtrinsicSeed()
+/*****************************************************************************/
+{
+  // Converting from lidar_frame needs its TF, so wait for the laser; getLaser applies it then.
+  if (!pending_extrinsic_seed_ || lasers_.empty()) {
+    return;
+  }
+  Pose2 correction;
+  if (!closure_assistant_->toSolverCorrection(*pending_extrinsic_seed_, correction)) {
+    return;
+  }
+  pending_extrinsic_seed_.reset();
+  if (solver_->SetSensorOffsetCorrection(correction)) {
+    smapper_->getMapper()->ApplySensorOffsetCorrections();
+    closure_assistant_->updateExtrinsicCalibration();
+  }
 }
 
 /*****************************************************************************/
@@ -491,6 +602,10 @@ LocalizedRangeScan * SlamToolbox::getLocalizedRangeScan(
   // create localized range scan
   LocalizedRangeScan * range_scan = new LocalizedRangeScan(
     laser->GetName(), readings);
+  if (use_reflectors_) {
+    range_scan->SetReflectorWeights(
+      laser_utils::scanToReflectorWeights(*scan, lasers_[scan->header.frame_id].isInverted()));
+  }
   range_scan->SetOdometricPose(transformed_pose);
   range_scan->SetCorrectedPose(transformed_pose);
   range_scan->SetTime(rclcpp::Time(scan->header.stamp).nanoseconds()/1.e9);

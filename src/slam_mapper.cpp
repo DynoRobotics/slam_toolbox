@@ -391,6 +391,226 @@ void SMapper::configure(const rclcpp::Node::SharedPtr & node)
   }
   node->get_parameter("occupancy_threshold", occupancy_threshold);
   mapper_->setParamOccupancyThreshold(occupancy_threshold);
+
+  // Reflector-aided sequential matching (REFLECTOR_SLAM.md §5). use_reflectors is also read by
+  // SlamToolbox, which attaches the scans' reflector weights.
+  bool use_reflectors = false;
+  if (!node->has_parameter("use_reflectors")) {
+    node->declare_parameter("use_reflectors", use_reflectors);
+  }
+  node->get_parameter("use_reflectors", use_reflectors);
+  mapper_->setParamUseReflectors(use_reflectors);
+
+  bool use_geometry = true;
+  if (!node->has_parameter("use_geometry")) {
+    node->declare_parameter("use_geometry", use_geometry);
+  }
+  node->get_parameter("use_geometry", use_geometry);
+  if (!use_geometry && !use_reflectors) {
+    RCLCPP_WARN(node->get_logger(),
+      "use_geometry is false but use_reflectors is false too; matching on geometry.");
+    use_geometry = true;
+  }
+  if (!use_geometry) {
+    RCLCPP_WARN(node->get_logger(),
+      "use_geometry is false: matching on reflectors only; loop closure has nothing to match "
+      "unless use_reflectors_in_loop_closure is true.");
+  }
+  mapper_->setParamUseGeometry(use_geometry);
+
+  double reflector_weight = 1.0;
+  if (!node->has_parameter("reflector_weight")) {
+    node->declare_parameter("reflector_weight", reflector_weight);
+  }
+  node->get_parameter("reflector_weight", reflector_weight);
+  mapper_->setParamReflectorWeight(reflector_weight);
+
+  double reflector_smear_deviation = 0.02;
+  if (!node->has_parameter("reflector_smear_deviation")) {
+    node->declare_parameter("reflector_smear_deviation", reflector_smear_deviation);
+  }
+  node->get_parameter("reflector_smear_deviation", reflector_smear_deviation);
+  mapper_->setParamReflectorSmearDeviation(reflector_smear_deviation);
+
+  double reflector_response_cap = 3.0;
+  if (!node->has_parameter("reflector_response_cap")) {
+    node->declare_parameter("reflector_response_cap", reflector_response_cap);
+  }
+  node->get_parameter("reflector_response_cap", reflector_response_cap);
+  mapper_->setParamReflectorResponseCap(reflector_response_cap);
+
+  // score: add the two responses (stage 3); information: fuse separate geometry and reflector
+  // estimates by their covariances, with a consistency gate (REFLECTOR_SLAM.md §5.5).
+  std::string reflector_fusion = "score";
+  if (!node->has_parameter("reflector_fusion")) {
+    node->declare_parameter("reflector_fusion", reflector_fusion);
+  }
+  node->get_parameter("reflector_fusion", reflector_fusion);
+  if (reflector_fusion != "score" && reflector_fusion != "information") {
+    RCLCPP_WARN(node->get_logger(),
+      "Unknown reflector_fusion '%s' (score or information); using score.",
+      reflector_fusion.c_str());
+    reflector_fusion = "score";
+  }
+  mapper_->setParamReflectorInformationFusion(reflector_fusion == "information");
+
+  double reflector_covariance_window = 0.9;
+  if (!node->has_parameter("reflector_covariance_window")) {
+    node->declare_parameter("reflector_covariance_window", reflector_covariance_window);
+  }
+  node->get_parameter("reflector_covariance_window", reflector_covariance_window);
+  mapper_->setParamReflectorCovarianceWindow(reflector_covariance_window);
+
+  double reflector_consistency_gate_chi2 = 11.34;
+  if (!node->has_parameter("reflector_consistency_gate_chi2")) {
+    node->declare_parameter("reflector_consistency_gate_chi2", reflector_consistency_gate_chi2);
+  }
+  node->get_parameter("reflector_consistency_gate_chi2", reflector_consistency_gate_chi2);
+  mapper_->setParamReflectorConsistencyGateChi2(reflector_consistency_gate_chi2);
+
+  bool reflector_fuse_heading = true;
+  if (!node->has_parameter("reflector_fuse_heading")) {
+    node->declare_parameter("reflector_fuse_heading", reflector_fuse_heading);
+  }
+  node->get_parameter("reflector_fuse_heading", reflector_fuse_heading);
+  mapper_->setParamReflectorFuseHeading(reflector_fuse_heading);
+
+  bool use_reflectors_in_loop_closure = false;
+  if (!node->has_parameter("use_reflectors_in_loop_closure")) {
+    node->declare_parameter("use_reflectors_in_loop_closure", use_reflectors_in_loop_closure);
+  }
+  node->get_parameter("use_reflectors_in_loop_closure", use_reflectors_in_loop_closure);
+  mapper_->setParamReflectorsInLoopClosure(use_reflectors_in_loop_closure);
+
+  // Loop closure in a featureless corridor (REFLECTOR_SLAM.md §5.9).
+  bool loop_match_relative_covariance = false;
+  if (!node->has_parameter("loop_match_relative_covariance")) {
+    node->declare_parameter("loop_match_relative_covariance", loop_match_relative_covariance);
+  }
+  node->get_parameter("loop_match_relative_covariance", loop_match_relative_covariance);
+  mapper_->setParamLoopMatchRelativeCovariance(loop_match_relative_covariance);
+
+  bool loop_closure_coarse_covariance = false;
+  if (!node->has_parameter("loop_closure_coarse_covariance")) {
+    node->declare_parameter("loop_closure_coarse_covariance", loop_closure_coarse_covariance);
+  }
+  node->get_parameter("loop_closure_coarse_covariance", loop_closure_coarse_covariance);
+  mapper_->setParamLoopClosureCoarseCovariance(loop_closure_coarse_covariance);
+
+  // Stage 6 (REFLECTOR_SLAM.md 5.10): odometry prior.
+  bool odometry_prior_fusion = false;
+  if (!node->has_parameter("odometry_prior_fusion")) {
+    node->declare_parameter("odometry_prior_fusion", odometry_prior_fusion);
+  }
+  node->get_parameter("odometry_prior_fusion", odometry_prior_fusion);
+  mapper_->setParamOdometryPriorFusion(odometry_prior_fusion);
+
+  double odometry_prior_stddev_xy_per_m = 0.05;
+  if (!node->has_parameter("odometry_prior_stddev_xy_per_m")) {
+    node->declare_parameter("odometry_prior_stddev_xy_per_m", odometry_prior_stddev_xy_per_m);
+  }
+  node->get_parameter("odometry_prior_stddev_xy_per_m", odometry_prior_stddev_xy_per_m);
+  mapper_->setParamOdometryPriorStddevXyPerMeter(odometry_prior_stddev_xy_per_m);
+
+  double odometry_prior_stddev_xy_min = 0.005;
+  if (!node->has_parameter("odometry_prior_stddev_xy_min")) {
+    node->declare_parameter("odometry_prior_stddev_xy_min", odometry_prior_stddev_xy_min);
+  }
+  node->get_parameter("odometry_prior_stddev_xy_min", odometry_prior_stddev_xy_min);
+  mapper_->setParamOdometryPriorStddevXyMin(odometry_prior_stddev_xy_min);
+
+  double odometry_prior_stddev_yaw_per_rad = 0.05;
+  if (!node->has_parameter("odometry_prior_stddev_yaw_per_rad")) {
+    node->declare_parameter("odometry_prior_stddev_yaw_per_rad", odometry_prior_stddev_yaw_per_rad);
+  }
+  node->get_parameter("odometry_prior_stddev_yaw_per_rad", odometry_prior_stddev_yaw_per_rad);
+  mapper_->setParamOdometryPriorStddevYawPerRadian(odometry_prior_stddev_yaw_per_rad);
+
+  double odometry_prior_stddev_yaw_per_m = 0.01;
+  if (!node->has_parameter("odometry_prior_stddev_yaw_per_m")) {
+    node->declare_parameter("odometry_prior_stddev_yaw_per_m", odometry_prior_stddev_yaw_per_m);
+  }
+  node->get_parameter("odometry_prior_stddev_yaw_per_m", odometry_prior_stddev_yaw_per_m);
+  mapper_->setParamOdometryPriorStddevYawPerMeter(odometry_prior_stddev_yaw_per_m);
+
+  double odometry_prior_stddev_yaw_min = 0.002;
+  if (!node->has_parameter("odometry_prior_stddev_yaw_min")) {
+    node->declare_parameter("odometry_prior_stddev_yaw_min", odometry_prior_stddev_yaw_min);
+  }
+  node->get_parameter("odometry_prior_stddev_yaw_min", odometry_prior_stddev_yaw_min);
+  mapper_->setParamOdometryPriorStddevYawMin(odometry_prior_stddev_yaw_min);
+
+  double odometry_prior_gate_chi2 = 11.34;
+  if (!node->has_parameter("odometry_prior_gate_chi2")) {
+    node->declare_parameter("odometry_prior_gate_chi2", odometry_prior_gate_chi2);
+  }
+  node->get_parameter("odometry_prior_gate_chi2", odometry_prior_gate_chi2);
+  mapper_->setParamOdometryPriorGateChi2(odometry_prior_gate_chi2);
+
+  double odometry_prior_stddev_cross_per_m = 0.05;
+  if (!node->has_parameter("odometry_prior_stddev_cross_per_m")) {
+    node->declare_parameter("odometry_prior_stddev_cross_per_m",
+      odometry_prior_stddev_cross_per_m);
+  }
+  node->get_parameter("odometry_prior_stddev_cross_per_m", odometry_prior_stddev_cross_per_m);
+  mapper_->setParamOdometryPriorStddevCrossPerMeter(odometry_prior_stddev_cross_per_m);
+
+  bool odometry_prior_fuse_heading = false;
+  if (!node->has_parameter("odometry_prior_fuse_heading")) {
+    node->declare_parameter("odometry_prior_fuse_heading", odometry_prior_fuse_heading);
+  }
+  node->get_parameter("odometry_prior_fuse_heading", odometry_prior_fuse_heading);
+  mapper_->setParamOdometryPriorFuseHeading(odometry_prior_fuse_heading);
+
+  double near_chain_minimum_response_coarse = 0.35;
+  if (!node->has_parameter("near_chain_minimum_response_coarse")) {
+    node->declare_parameter("near_chain_minimum_response_coarse",
+      near_chain_minimum_response_coarse);
+  }
+  node->get_parameter("near_chain_minimum_response_coarse", near_chain_minimum_response_coarse);
+  mapper_->setParamNearChainMinimumResponseCoarse(near_chain_minimum_response_coarse);
+
+  int link_chain_scans = 1;
+  if (!node->has_parameter("link_chain_scans")) {
+    node->declare_parameter("link_chain_scans", link_chain_scans);
+  }
+  node->get_parameter("link_chain_scans", link_chain_scans);
+  mapper_->setParamLinkChainScans(link_chain_scans);
+
+  bool near_chain_gated = false;
+  if (!node->has_parameter("near_chain_gated")) {
+    node->declare_parameter("near_chain_gated", near_chain_gated);
+  }
+  node->get_parameter("near_chain_gated", near_chain_gated);
+  mapper_->setParamNearChainGated(near_chain_gated);
+
+  bool loop_closure_move_scan = true;
+  if (!node->has_parameter("loop_closure_move_scan")) {
+    node->declare_parameter("loop_closure_move_scan", loop_closure_move_scan);
+  }
+  node->get_parameter("loop_closure_move_scan", loop_closure_move_scan);
+  mapper_->setParamLoopClosureMoveScan(loop_closure_move_scan);
+
+  double loop_closure_gate_chi2 = 0.0;
+  if (!node->has_parameter("loop_closure_gate_chi2")) {
+    node->declare_parameter("loop_closure_gate_chi2", loop_closure_gate_chi2);
+  }
+  node->get_parameter("loop_closure_gate_chi2", loop_closure_gate_chi2);
+  mapper_->setParamLoopClosureGateChi2(loop_closure_gate_chi2);
+
+  double loop_closure_gate_drift_xy = 0.05;
+  if (!node->has_parameter("loop_closure_gate_drift_xy")) {
+    node->declare_parameter("loop_closure_gate_drift_xy", loop_closure_gate_drift_xy);
+  }
+  node->get_parameter("loop_closure_gate_drift_xy", loop_closure_gate_drift_xy);
+  mapper_->setParamLoopClosureGateDriftXY(loop_closure_gate_drift_xy);
+
+  double loop_closure_gate_drift_yaw = 0.01;
+  if (!node->has_parameter("loop_closure_gate_drift_yaw")) {
+    node->declare_parameter("loop_closure_gate_drift_yaw", loop_closure_gate_drift_yaw);
+  }
+  node->get_parameter("loop_closure_gate_drift_yaw", loop_closure_gate_drift_yaw);
+  mapper_->setParamLoopClosureGateDriftYaw(loop_closure_gate_drift_yaw);
 }
 
 /*****************************************************************************/

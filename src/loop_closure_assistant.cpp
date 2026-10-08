@@ -75,8 +75,10 @@ LoopClosureAssistant::LoopClosureAssistant(
   // Debug visualization of the live, jointly-optimized sensor extrinsic estimate (see
   // PLAN.md step 10). Empty/unpublished unless optimize_sensor_extrinsics is enabled -
   // solver_->GetSensorOffsetCorrections() returns an empty map otherwise.
+  // Latched, like the other calibration state (/gyro_z_bias): a late subscriber (RUI,
+  // afw_calibration's calibration_node) gets the current estimate at once.
   extrinsic_pub_ = node_->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-    "slam_toolbox/sensor_extrinsic_calibration", rclcpp::QoS(1));
+    "slam_toolbox/sensor_extrinsic_calibration", rclcpp::QoS(1).transient_local());
 
   // Frame to publish the extrinsic debug pose in. Left unset, falls back to base_frame_ (the
   // original behavior). Set to the lidar's own TF frame (e.g. "lidar_link") to instead publish
@@ -88,6 +90,15 @@ LoopClosureAssistant::LoopClosureAssistant(
   if (lidar_frame_.empty()) {
     lidar_frame_ = base_frame_;
   }
+
+  // lidar_frame_ -> calibrated_lidar_frame_ is the estimate's correction of the nominal mount:
+  // a lidar scan drawn in it lines up with the map. Identity until there is an estimate, so the
+  // frame always exists, also with extrinsic calibration off.
+  node_->declare_parameter("calibrated_lidar_frame", lidar_frame_ + "_calibrated");
+  calibrated_lidar_frame_ = node_->get_parameter("calibrated_lidar_frame").as_string();
+  static_tf_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(node_);
+  calibrated_lidar_pose_.orientation.w = 1.0;
+  broadcastCalibratedLidarFrame();
 
   // Republish the last computed extrinsic estimate at a fixed, faster rate than publishGraph()
   // runs at (map_update_interval / loop closures / periodic solve), purely so RViz's
@@ -292,10 +303,18 @@ void LoopClosureAssistant::publishGraph()
   interactive_server_->applyChanges();
   marker_publisher_->publish(marray);
 
+  updateExtrinsicCalibration();
+}
+
+/*****************************************************************************/
+void LoopClosureAssistant::updateExtrinsicCalibration()
+/*****************************************************************************/
+{
   // compute/cache the live sensor extrinsic (lidar<->base_link) calibration estimate, if any -
-  // empty/no-op unless optimize_sensor_extrinsics is enabled and at least one solve has
-  // completed. Published relative to its frozen nominal, in lidar_frame_, so it's directly
-  // comparable to e.g. a test rig's deliberately-offset lidar link in RViz.
+  // empty/no-op unless optimize_sensor_extrinsics is enabled and the laser exists. Published
+  // relative to its frozen nominal, in lidar_frame_, so it's directly comparable to e.g. a test
+  // rig's deliberately-offset lidar link in RViz, and broadcast as lidar_frame_ ->
+  // calibrated_lidar_frame_.
   const auto & offset_corrections = solver_->GetSensorOffsetCorrections();
   const auto & offset_covariances = solver_->GetSensorOffsetCovariances();
   const auto & nominal_offsets = solver_->GetSensorNominalOffsets();
@@ -309,36 +328,25 @@ void LoopClosureAssistant::publishGraph()
     if (nominal_it != nominal_offsets.end()) {
       nominal = nominal_it->second;
     }
-    karto::Transform toNominalFrame(nominal, karto::Pose2());
-    const karto::Pose2 residual = toNominalFrame.TransformPose(estimate);
+    const karto::Pose2 residual = karto::Transform(nominal).InverseTransformPose(estimate);
 
     geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
     pose_msg.header.frame_id = lidar_frame_;
     pose_msg.header.stamp = node_->now();
-
-    // lidar_frame_ may be mounted upside-down relative to base_frame_ (Z axis flipped in
-    // world space). karto/Ceres only ever reasons in 2D, so every yaw value it produces is
-    // implicitly "measured about base_frame_'s own upright Z axis" -- publishing that same
-    // value as a rotation about a Z-flipped child frame's own axis silently negates its visual
-    // sense (R.Rz(th).R^-1 = Rz(-th) whenever R maps Z -> -Z). Correct for it here.
-    double published_heading = residual.GetHeading();
-    if (isLidarFrameInverted()) {
-      published_heading = -published_heading;
-    }
-
-    tf2::Quaternion q(0., 0., 0., 1.0);
-    q.setRPY(0., 0., published_heading);
-    tf2::Transform transform(q, tf2::Vector3(residual.GetX(), residual.GetY(), 0.0));
-    tf2::toMsg(transform, pose_msg.pose.pose);
+    pose_msg.pose.pose = toLidarFrame(residual);
 
     const auto cov_it = offset_covariances.find(sensorCorrection.first);
     if (cov_it != offset_covariances.end()) {
-      // rotate the covariance into the same (nominal) frame the position was just expressed in
+      // rotate the covariance into the same (nominal) frame the position was just expressed in,
+      // and mirror it like the pose (toLidarFrame) for an upside-down lidar
       Eigen::Matrix3d rot = Eigen::Matrix3d::Identity();
       const double c = std::cos(-nominal.GetHeading());
       const double s = std::sin(-nominal.GetHeading());
       rot(0, 0) = c; rot(0, 1) = -s;
       rot(1, 0) = s; rot(1, 1) = c;
+      if (isLidarFrameInverted()) {
+        rot = Eigen::Vector3d(1.0, -1.0, -1.0).asDiagonal() * rot;
+      }
       const Eigen::Matrix3d cov = rot * cov_it->second * rot.transpose();
       pose_msg.pose.covariance[0] = cov(0, 0);   // x
       pose_msg.pose.covariance[1] = cov(0, 1);   // xy
@@ -349,9 +357,64 @@ void LoopClosureAssistant::publishGraph()
 
     boost::mutex::scoped_lock lock(extrinsic_mutex_);
     last_extrinsic_msgs_[sensorCorrection.first] = pose_msg;
+    // One lidar: the calibrated frame follows it. Static (latched), re-sent only on change.
+    if (pose_msg.pose.pose != calibrated_lidar_pose_) {
+      calibrated_lidar_pose_ = pose_msg.pose.pose;
+      broadcastCalibratedLidarFrame();
+    }
   }
 
   publishExtrinsicCalibration();
+}
+
+/*****************************************************************************/
+void LoopClosureAssistant::broadcastCalibratedLidarFrame()
+/*****************************************************************************/
+{
+  geometry_msgs::msg::TransformStamped t;
+  t.header.stamp = node_->now();
+  t.header.frame_id = lidar_frame_;
+  t.child_frame_id = calibrated_lidar_frame_;
+  t.transform.translation.x = calibrated_lidar_pose_.position.x;
+  t.transform.translation.y = calibrated_lidar_pose_.position.y;
+  t.transform.translation.z = calibrated_lidar_pose_.position.z;
+  t.transform.rotation = calibrated_lidar_pose_.orientation;
+  static_tf_broadcaster_->sendTransform(t);
+}
+
+/*****************************************************************************/
+geometry_msgs::msg::Pose LoopClosureAssistant::toLidarFrame(const karto::Pose2 & correction)
+/*****************************************************************************/
+{
+  // karto/Ceres only ever reason in 2D about base_frame_'s upright Z axis. For a lidar mounted
+  // upside-down (lidar_frame_'s Z axis pointing down, rolled by pi), karto's sensor frame is
+  // lidar_frame_ mirrored across its x axis (the scan is reversed instead), so the same
+  // correction in lidar_frame_ has its y and its yaw negated.
+  const double sign = isLidarFrameInverted() ? -1.0 : 1.0;
+  geometry_msgs::msg::Pose pose;
+  pose.position.x = correction.GetX();
+  pose.position.y = sign * correction.GetY();
+  tf2::Quaternion q;
+  q.setRPY(0., 0., sign * correction.GetHeading());
+  pose.orientation = tf2::toMsg(q);
+  return pose;
+}
+
+/*****************************************************************************/
+bool LoopClosureAssistant::toSolverCorrection(
+  const geometry_msgs::msg::Pose & lidar_correction, karto::Pose2 & correction)
+/*****************************************************************************/
+{
+  // the inverse of toLidarFrame, which needs the lidar's TF
+  const bool inverted = isLidarFrameInverted();
+  if (!lidar_frame_inversion_checked_) {
+    return false;
+  }
+  const double sign = inverted ? -1.0 : 1.0;
+  correction = karto::Pose2(
+    lidar_correction.position.x, sign * lidar_correction.position.y,
+    sign * tf2::getYaw(lidar_correction.orientation));
+  return true;
 }
 
 /*****************************************************************************/

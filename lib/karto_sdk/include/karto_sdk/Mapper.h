@@ -313,6 +313,15 @@ public:
     return m_HasOdomFrameData;
   }
 
+  /**
+   * What created this edge (REFLECTOR_SLAM.md §5.9, diagnosis); not serialized, so edges loaded
+   * with a map report kOriginUnknown.
+   */
+  enum Origin : kt_int32u { kOriginUnknown = 0, kOriginSequential, kOriginNearChain,
+    kOriginLoopClosure };
+  inline void SetOrigin(kt_int32u origin) {m_Origin = origin;}
+  inline kt_int32u GetOrigin() const {return m_Origin;}
+
 private:
   Pose2 m_Pose1;
   Pose2 m_Pose2;
@@ -325,6 +334,7 @@ private:
 
   Pose2 m_OdomPoseDifference;
   kt_bool m_HasOdomFrameData = false;
+  kt_int32u m_Origin = kOriginUnknown;
 
   friend class boost::serialization::access;
   template<class Archive>
@@ -835,6 +845,23 @@ public:
 
 public:
   /**
+   * Loop-closure attempts by outcome (REFLECTOR_SLAM.md §5.9, diagnosis). Not serialized.
+   */
+  struct LoopClosureStats
+  {
+    kt_int32u attempts = 0;
+    kt_int32u rejectedCoarseResponse = 0;
+    kt_int32u rejectedVariance = 0;
+    kt_int32u rejectedFineResponse = 0;
+    kt_int32u rejectedGate = 0;
+    kt_int32u accepted = 0;
+    // attempts whose coarse match used the reflector layer
+    kt_int32u reflectorsActive = 0;
+    // every attempt's coarse response, for choosing the threshold (offline_replay prints them)
+    std::vector<kt_double> coarseResponses;
+  };
+
+  /**
    * Adds a vertex representing the given scan to the graph
    * @param pScan
    */
@@ -866,6 +893,26 @@ public:
    * @param rSensorName
    */
   kt_bool TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSensorName);
+
+  /**
+   * Gated match of a scan against a chain (REFLECTOR_SLAM.md §5.9): the loop matcher's wide
+   * coarse search with the response and variance gates, the sequential matcher's fine match,
+   * L2's covariance and L4's consistency gate. Used by loop closure and, with NearChainGated, by
+   * near-chain linking; counts outcomes in rStats.
+   */
+  kt_bool MatchChainGated(
+    LocalizedRangeScan * pScan, const LocalizedRangeScanVector & rChain,
+    kt_double minimumCoarseResponse, kt_double minimumFineResponse, LoopClosureStats & rStats,
+    Pose2 & rMean, Matrix3 & rCovariance);
+
+  /**
+   * L4 (REFLECTOR_SLAM.md §5.9): whether a loop closure's correction of the scan agrees with the
+   * current graph within the closure's covariance plus the drift possible over the path from the
+   * chain to the scan (LoopClosureGate*). Always true with the gate off.
+   */
+  kt_bool ClosureConsistentWithGraph(
+    const LocalizedRangeScanVector & rChain, LocalizedRangeScan * pScan,
+    const Pose2 & rClosurePose, const Matrix3 & rCovariance);
 
   /**
    * Optimizes scan poses
@@ -917,6 +964,18 @@ public:
   inline ScanMatcher * GetLoopScanMatcher() const
   {
     return m_pLoopScanMatcher;
+  }
+
+
+  inline const LoopClosureStats & GetLoopClosureStats() const
+  {
+    return m_LoopClosureStats;
+  }
+
+  // Near-chain links matched through MatchChainGated (NearChainGated), by outcome.
+  inline const LoopClosureStats & GetNearChainStats() const
+  {
+    return m_NearChainStats;
   }
 
   /**
@@ -991,6 +1050,15 @@ private:
     const Matrix3 & rCovariance);
 
   /**
+   * L9 (REFLECTOR_SLAM.md §5.9): LinkChainToScan's link spread over the chain's chainScans
+   * closest scans within the link distance (not already linked to pScan), each edge with the
+   * covariance times the number of edges made.
+   */
+  void LinkChainToScanSpread(
+    const LocalizedRangeScanVector & rChain, LocalizedRangeScan * pScan, const Pose2 & rPose,
+    const Pose2 & rMean, const Matrix3 & rCovariance, kt_int32u chainScans);
+
+  /**
    * Find chains of scans that are close to given scan
    * @param pScan
    * @return chains of scans
@@ -1042,6 +1110,12 @@ private:
    * a fresh replay after map load simply restarts the count at zero.
    */
   int m_NodesSinceLastPeriodicSolve = 0;
+
+  // Origin given to the edges LinkScans creates next (LinkInfo::Origin), and loop-closure
+  // statistics. Not serialized.
+  kt_int32u m_LinkOrigin = LinkInfo::kOriginSequential;
+  LoopClosureStats m_LoopClosureStats;
+  LoopClosureStats m_NearChainStats;
 
   /**
    * Serialization: class MapperGraph
@@ -1207,6 +1281,59 @@ public:
   {
     static const std::unordered_map<std::string, Pose2> empty;
     return empty;
+  }
+
+  /**
+   * Replace the sensor extrinsic estimate(s) by nominal * correction, the correction being
+   * nominal^-1 * estimate in karto's sensor frame, clamped to the solver's limits; also kept
+   * for sensors that are created later (InitializeSensorOffset). A persisted calibration at
+   * startup, or the identity to reset. Returns true when an existing estimate changed: the
+   * caller then feeds it back with MapperGraph::ApplySensorOffsetCorrections. The next solve
+   * starts from it, so the graph's evidence still moves it from there.
+   */
+  virtual kt_bool SetSensorOffsetCorrection(const Pose2 & /*correction*/)
+  {
+    return false;
+  }
+
+  /**
+   * Create the sensor's extrinsic estimate as soon as the sensor is known rather than at its
+   * first edge, from its nominal (TF) offset and the correction last given to
+   * SetSensorOffsetCorrection, so the very first scans use it. Returns false (estimate
+   * untouched) when the solver does not calibrate extrinsics.
+   */
+  virtual kt_bool InitializeSensorOffset(
+    const std::string & /*sensorName*/, const Pose2 & /*nominal*/, Pose2 & /*estimate*/)
+  {
+    return false;
+  }
+
+  /**
+   * The parts of a sensor extrinsic estimate that are learned (or not) separately.
+   */
+  enum SensorOffsetComponent
+  {
+    SensorOffsetXY,
+    SensorOffsetYaw
+  };
+
+  /**
+   * Whether solves keep updating one component of the sensor extrinsic estimate. Off, its
+   * current value (a seed, or what was learned so far) is frozen but still used. Returns false
+   * (and does nothing) when the solver does not calibrate extrinsics.
+   */
+  virtual kt_bool SetSensorOffsetEstimation(
+    SensorOffsetComponent /*component*/, kt_bool /*estimate*/)
+  {
+    return false;
+  }
+
+  /**
+   * Whether that component is being updated (false when not calibrated at all).
+   */
+  virtual kt_bool GetSensorOffsetEstimation(SensorOffsetComponent /*component*/) const
+  {
+    return false;
   }
 
   friend class boost::serialization::access;
@@ -1589,6 +1716,68 @@ public:
     return m_pCorrelationGrid;
   }
 
+  /**
+   * What the reflector layer did in the last penalized match, i.e. the sequential match of a
+   * new scan (linking near chains and loop closure match without the odometry penalty).
+   */
+  struct ReflectorMatchStats
+  {
+    kt_bool active = false;
+    kt_int32u scanPoints = 0;
+    kt_int32u referencePoints = 0;
+    kt_int32u matched = 0;
+    kt_double response = 0.0;
+    // Information fusion (§5.5): the reflector estimate was fused, or rejected by the gate with
+    // squared Mahalanobis distance gateD2.
+    kt_bool fused = false;
+    kt_bool gated = false;
+    kt_double gateD2 = 0.0;
+  };
+
+  inline const ReflectorMatchStats & GetLastReflectorStats() const
+  {
+    return m_LastReflectorStats;
+  }
+
+  /**
+   * The last online sequential match (REFLECTOR_SLAM.md 5.10, S0): the odometry prediction it
+   * searched around, the scan-only estimate and its covariance, and the pose taken, which is
+   * the scan estimate fused with the odometry prior when OdometryPriorFusion is on.
+   */
+  struct MatchDiagnostics
+  {
+    kt_bool valid = false;
+    Pose2 predicted;
+    Pose2 scanMean;
+    Matrix3 scanCovariance;
+    Pose2 mean;
+    Matrix3 poseCovariance;
+    kt_bool prior = false;
+    kt_bool priorGated = false;
+    kt_double priorD2 = 0.0;
+  };
+
+  inline const MatchDiagnostics & GetLastMatch() const
+  {
+    return m_LastMatch;
+  }
+
+  /**
+   * Write every candidate pose of every search to this stream (diagnostics, offline_replay
+   * --surface): time, fine pass, score source, search centre, candidate, penalized and raw
+   * response. nullptr stops.
+   */
+  inline void SetSurfaceDump(std::ostream * pStream)
+  {
+    m_pSurfaceDump = pStream;
+  }
+
+  // Whether the last match, of any kind, used the reflector layer.
+  inline kt_bool LastMatchUsedReflectors() const
+  {
+    return m_ReflectorsActive;
+  }
+
 private:
   /**
    * Marks cells where scans' points hit as being occupied
@@ -1618,6 +1807,18 @@ private:
     LocalizedRangeScan * pScan,
     const Vector2<kt_double> & rViewPoint) const;
 
+  // Karto's odometry penalty for a candidate offset from the search centre.
+  kt_double Penalty(kt_double squaredDistance, kt_double angleOffset) const;
+
+  /**
+   * After an online sequential match: record the diagnostics and, with OdometryPriorFusion,
+   * replace rMean by the scan estimate fused with the odometry prediction. rCovariance stays
+   * the scan's (the graph gets odometry from its own edges).
+   */
+  void FinishSequentialMatch(
+    LocalizedRangeScan * pScan, const Pose2 & rPredicted, Pose2 & rMean,
+    const Matrix3 & rCovariance);
+
   /**
    * Get response at given position for given rotation (only look up valid points)
    * @param angleIndex
@@ -1625,6 +1826,92 @@ private:
    * @return response
    */
   kt_double GetResponse(kt_int32u angleIndex, kt_int32s gridPositionIndex) const;
+
+  /**
+   * Score of a candidate pose before the odometry penalty (REFLECTOR_SLAM.md §5.3):
+   *   R = (g R_geom + w R_refl) / (g + w),  g = UseGeometry, w = ReflectorWeight,
+   * or R_geom alone while the reflector layer is inactive, so matching is then exactly stock.
+   * rAccept gets the response the match is accepted on: R_geom, or R_refl without geometry.
+   * @param angleIndex
+   * @param gridPositionIndex index of the pose position in the geometry grid
+   * @param reflectorGridIndex index of the pose position in the reflector grid
+   * @param rAccept
+   */
+  kt_double GetScore(
+    kt_int32u angleIndex, kt_int32s gridPositionIndex, kt_int32s reflectorGridIndex,
+    kt_double & rAccept) const;
+
+  /**
+   * R_refl = min(S, K) / K with S the weighted, normalized reflector grid values under the
+   * scan's reflector points rotated by the given angle.
+   */
+  kt_double GetReflectorResponse(kt_int32u angleIndex, kt_int32s reflectorGridIndex) const;
+
+  /**
+   * Index of a world position in the reflector grid (its border differs from the geometry
+   * grid's because the smear kernel does), or 0 while the layer is inactive.
+   */
+  kt_int32s ReflectorGridIndex(const Vector2<kt_double> & rPosition) const;
+
+  /**
+   * Sets up the reflector layer for one match: the grid, the scan's reflector weights and
+   * whether this match uses reflectors at all. Reference points go in through AddScan.
+   */
+  void PrepareReflectors(LocalizedRangeScan * pScan);
+
+  /**
+   * Per-angle grid index offsets of the scan's reflector points, like
+   * GridIndexLookup::ComputeOffsets for the range points.
+   */
+  void ComputeReflectorOffsets(
+    LocalizedRangeScan * pScan, kt_double angleCenter, kt_double angleOffset,
+    kt_double angleResolution);
+
+  /**
+   * Number of the scan's reflector points that land on a reference reflector (grid value of
+   * at least half of occupied) at the given sensor pose.
+   */
+  kt_int32u CountMatchedReflectors(LocalizedRangeScan * pScan, const Pose2 & rSensorPose) const;
+
+  /**
+   * Whether this matcher may use reflectors: the sequential matcher (which also links near
+   * chains and does loop closure's fine match), and the loop matcher with
+   * ReflectorsInLoopClosure.
+   */
+  kt_bool ReflectorsAllowed() const;
+
+  // Which response the search scores: the combined score, or one source alone (§5.5).
+  enum class ScoreSource { Combined, Geometry, Reflector };
+
+  struct SourceEstimate
+  {
+    Pose2 mean;
+    Matrix3 covariance;
+    kt_double response = 0.0;
+    kt_bool valid = false;
+  };
+
+  /**
+   * Pose and full 3x3 covariance of one source's response surface: coarse search over the
+   * whole window (position block and position-heading coupling, from the poses within the
+   * relative window), then the fine search (refined mean, heading variance at that position).
+   */
+  SourceEstimate EstimateSource(
+    ScoreSource source, LocalizedRangeScan * pScan, const Pose2 & rSearchCenter,
+    const Vector2<kt_double> & rCoarseSearchOffset,
+    const Vector2<kt_double> & rCoarseSearchResolution, kt_bool doPenalize,
+    kt_bool doRefineMatch);
+
+  /**
+   * Information-aware matching (§5.5): geometry and reflector estimates, consistency gate,
+   * fusion by covariance. Returns the geometry response to accept the match on, or a negative
+   * value when there is no geometry match, for the stock search to take over.
+   */
+  kt_double MatchInformation(
+    LocalizedRangeScan * pScan, const Pose2 & rSearchCenter,
+    const Vector2<kt_double> & rCoarseSearchOffset,
+    const Vector2<kt_double> & rCoarseSearchResolution, kt_bool doPenalize,
+    kt_bool doRefineMatch, Pose2 & rMean, Matrix3 & rCovariance);
 
 protected:
   /**
@@ -1653,6 +1940,31 @@ private:
   kt_int32u m_nAngles;
   kt_double m_searchAngleResolution;
   kt_bool m_doPenalize;
+
+  // Reflector layer, rebuilt for every match and never serialized: a scan matcher loaded with
+  // a map starts with these defaults.
+  CorrelationGrid * m_pReflectorGrid = nullptr;
+  kt_double m_ReflectorGridSmear = 0.0;
+  // Per angle index, the grid index offset of every reflector point of the scan being matched.
+  std::vector<std::vector<kt_int32s>> m_ReflectorOffsets;
+  std::vector<kt_double> m_ReflectorWeights;
+  // Reflectors wanted for this match (enabled, and the scan has reflector points) ...
+  kt_bool m_ReflectorsWanted = false;
+  // ... and active (the reference also put reflector points into the grid).
+  kt_bool m_ReflectorsActive = false;
+  kt_int32u m_ReferenceReflectorCount = 0;
+  kt_bool m_UseGeometry = true;
+  kt_double m_ReflectorWeight = 0.0;
+  kt_double m_ReflectorCap = 1.0;
+  // Parallel to m_pPoseResponse during CorrelateScan: the penalized acceptance response.
+  kt_double * m_pAcceptResponse = nullptr;
+  ReflectorMatchStats m_LastReflectorStats;
+  MatchDiagnostics m_LastMatch;
+  std::ostream * m_pSurfaceDump = nullptr;
+  ScoreSource m_ScoreSource = ScoreSource::Combined;
+  // Set by EstimateSource: CorrelateScan's coarse pass then also leaves the full covariance here.
+  kt_bool m_ComputeFullCovariance = false;
+  Matrix3 m_FullCovariance;
 
   /**
    * Serialization: class ScanMatcher
@@ -1868,6 +2180,15 @@ public:
    * Deletes all scan managers of all devices
    */
   void Clear();
+
+  /**
+   * Whether the device has a scan manager yet (GetScans etc. need one)
+   * @param rSensorName
+   */
+  inline kt_bool HasScanManager(const Name & rSensorName) const
+  {
+    return m_ScanManagers.find(rSensorName) != m_ScanManagers.end();
+  }
 
 private:
   /**
@@ -2201,6 +2522,13 @@ public:
    * @return graph
    */
   virtual MapperGraph * GetGraph() const;
+
+  /**
+   * Feed the solver's sensor extrinsic estimates back into the lasers' offsets and mark the
+   * sensors' scans dirty (their cached points depend on it). Part of CorrectPoses; also after
+   * ScanSolver::SetSensorOffsetCorrection, possibly before the first scan.
+   */
+  void ApplySensorOffsetCorrections();
 
   /**
    * Gets the sequential scan matcher
@@ -2542,6 +2870,57 @@ protected:
   // Minimum ratio of beams hitting cell to beams passing through cell to be marked as occupied
   Parameter<kt_double> * m_pOccupancyThreshold;
 
+  // Reflector-aided sequential matching (REFLECTOR_SLAM.md §5). Not serialized, like the two
+  // parameters above: slam_toolbox applies its ROS parameters again after loading a map.
+  // Match on the scans' reflector points too.
+  Parameter<kt_bool> * m_pUseReflectors;
+  // Match on the geometry; false matches on reflectors only (needs UseReflectors).
+  Parameter<kt_bool> * m_pUseGeometry;
+  // Weight w of the reflector response against the geometry response.
+  Parameter<kt_double> * m_pReflectorWeight;
+  // Smear deviation of the reflector correlation grid (m).
+  Parameter<kt_double> * m_pReflectorSmearDeviation;
+  // Cap K on the summed reflector hits: R_refl = min(S, K) / K.
+  Parameter<kt_double> * m_pReflectorResponseCap;
+  // Fuse separate geometry and reflector estimates by their covariances instead of adding the
+  // scores (REFLECTOR_SLAM.md §5.5).
+  Parameter<kt_bool> * m_pReflectorInformationFusion;
+  // Relative response window rho for the response-surface covariances: poses scoring at least
+  // rho times the best.
+  Parameter<kt_double> * m_pReflectorCovarianceWindow;
+  // chi^2 (3 DOF) bound on the disagreement of the two estimates; 0 disables the gate.
+  Parameter<kt_double> * m_pReflectorConsistencyGateChi2;
+  // Whether the reflector estimate informs heading in information fusion; false keeps heading
+  // from geometry (walls) and lets reflectors fix position only.
+  Parameter<kt_bool> * m_pReflectorFuseHeading;
+  // Whether loop closure (coarse loop matcher and fine match) uses the reflectors too.
+  Parameter<kt_bool> * m_pReflectorsInLoopClosure;
+  // Loop closure in a featureless corridor (REFLECTOR_SLAM.md §5.9), not serialized:
+  // L1: the loop matcher's coarse covariance from the relative-window 3x3 moments.
+  Parameter<kt_bool> * m_pLoopMatchRelativeCovariance;
+  // L2: closure edge covariance = fine + coarse (keeps the coarse search's ambiguity) ...
+  Parameter<kt_bool> * m_pLoopClosureCoarseCovariance;
+  // ... and whether an accepted closure moves the scan before the solve (stock: true).
+  Parameter<kt_bool> * m_pLoopClosureMoveScan;
+  // L6: match near chains like loop closures (MatchChainGated).
+  Parameter<kt_bool> * m_pNearChainGated;
+  Parameter<kt_int32u> * m_pLinkChainScans;
+  Parameter<kt_double> * m_pNearChainMinimumResponseCoarse;
+  // Stage 6 (REFLECTOR_SLAM.md 5.10): odometry prior.
+  Parameter<kt_bool> * m_pOdometryPriorFusion;
+  Parameter<kt_double> * m_pOdometryPriorStddevXyPerMeter;
+  Parameter<kt_double> * m_pOdometryPriorStddevXyMin;
+  Parameter<kt_double> * m_pOdometryPriorStddevYawPerRadian;
+  Parameter<kt_double> * m_pOdometryPriorStddevYawPerMeter;
+  Parameter<kt_double> * m_pOdometryPriorStddevYawMin;
+  Parameter<kt_double> * m_pOdometryPriorGateChi2;
+  Parameter<kt_bool> * m_pOdometryPriorFuseHeading;
+  Parameter<kt_double> * m_pOdometryPriorStddevCrossPerMeter;
+  // L4: consistency gate against the current graph; 0 disables it.
+  Parameter<kt_double> * m_pLoopClosureGateChi2;
+  Parameter<kt_double> * m_pLoopClosureGateDriftXY;   // m per m of path
+  Parameter<kt_double> * m_pLoopClosureGateDriftYaw;  // rad per m of path
+
   friend class boost::serialization::access;
   template<class Archive>
   void serialize(Archive & ar, const unsigned int version)
@@ -2636,6 +3015,23 @@ public:
   bool getParamUseResponseExpansion();
   int getParamMinPassThrough();
   double getParamOccupancyThreshold();
+  bool getParamUseReflectors();
+  bool getParamUseGeometry();
+  double getParamReflectorWeight();
+  double getParamReflectorSmearDeviation();
+  double getParamReflectorResponseCap();
+  bool getParamReflectorInformationFusion();
+  double getParamReflectorCovarianceWindow();
+  double getParamReflectorConsistencyGateChi2();
+  bool getParamReflectorFuseHeading();
+  bool getParamReflectorsInLoopClosure();
+  bool getParamLoopMatchRelativeCovariance();
+  bool getParamLoopClosureCoarseCovariance();
+  bool getParamLoopClosureMoveScan();
+  bool getParamNearChainGated();
+  double getParamLoopClosureGateChi2();
+  double getParamLoopClosureGateDriftXY();
+  double getParamLoopClosureGateDriftYaw();
 
   /* Setters */
   // General Parameters
@@ -2678,6 +3074,34 @@ public:
   void setParamUseResponseExpansion(bool b);
   void setParamMinPassThrough(int i);
   void setParamOccupancyThreshold(double d);
+  void setParamUseReflectors(bool b);
+  void setParamUseGeometry(bool b);
+  void setParamReflectorWeight(double d);
+  void setParamReflectorSmearDeviation(double d);
+  void setParamReflectorResponseCap(double d);
+  void setParamReflectorInformationFusion(bool b);
+  void setParamReflectorCovarianceWindow(double d);
+  void setParamReflectorConsistencyGateChi2(double d);
+  void setParamReflectorFuseHeading(bool b);
+  void setParamReflectorsInLoopClosure(bool b);
+  void setParamLoopMatchRelativeCovariance(bool b);
+  void setParamLoopClosureCoarseCovariance(bool b);
+  void setParamLoopClosureMoveScan(bool b);
+  void setParamNearChainGated(bool b);
+  void setParamLinkChainScans(int n);
+  void setParamNearChainMinimumResponseCoarse(double v);
+  void setParamOdometryPriorFusion(bool v);
+  void setParamOdometryPriorStddevXyPerMeter(double v);
+  void setParamOdometryPriorStddevXyMin(double v);
+  void setParamOdometryPriorStddevYawPerRadian(double v);
+  void setParamOdometryPriorStddevYawPerMeter(double v);
+  void setParamOdometryPriorStddevYawMin(double v);
+  void setParamOdometryPriorGateChi2(double v);
+  void setParamOdometryPriorFuseHeading(bool v);
+  void setParamOdometryPriorStddevCrossPerMeter(double v);
+  void setParamLoopClosureGateChi2(double d);
+  void setParamLoopClosureGateDriftXY(double d);
+  void setParamLoopClosureGateDriftYaw(double d);
 };
 BOOST_SERIALIZATION_ASSUME_ABSTRACT(Mapper)
 }  // namespace karto

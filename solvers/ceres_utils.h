@@ -198,6 +198,66 @@ private:
 /*****************************************************************************/
 /*****************************************************************************/
 
+// An odometry edge with its translation compared in the edge's midpoint frame (rotated by half
+// the edge's turn) instead of the start pose's. Odometry with a turn-rate error (gyro bias,
+// track-width error) believes it turns while driving straight; its chord then points half that
+// turn off the start heading while the true chord does not, a direction bias that the extrinsic
+// calibration took for a lidar yaw error. In the midpoint frame a constant turn-rate error
+// cancels to first order: the chord lies along the mid heading for both.
+class OdometryMidpointErrorTerm
+{
+public:
+  OdometryMidpointErrorTerm(
+    double x_ab, double y_ab, double yaw_ab_radians,
+    const Eigen::Matrix3d & sqrt_information)
+  : yaw_ab_radians_(yaw_ab_radians), sqrt_information_(sqrt_information)
+  {
+    // the measured chord, in the measured midpoint frame
+    const double c = std::cos(0.5 * yaw_ab_radians), s = std::sin(0.5 * yaw_ab_radians);
+    p_ab_mid_ = Eigen::Vector2d(c * x_ab + s * y_ab, -s * x_ab + c * y_ab);
+  }
+
+  template<typename T>
+  bool operator()(
+    const T * const x_a, const T * const y_a, const T * const yaw_a,
+    const T * const x_b, const T * const y_b, const T * const yaw_b,
+    T * residuals_ptr) const
+  {
+    const Eigen::Matrix<T, 2, 1> p_a(*x_a, *y_a);
+    const Eigen::Matrix<T, 2, 1> p_b(*x_b, *y_b);
+    const T turn = NormalizeAngle(*yaw_b - *yaw_a);
+    const T yaw_mid = *yaw_a + T(0.5) * turn;
+    Eigen::Map<Eigen::Matrix<T, 3, 1>> residuals_map(residuals_ptr);
+    residuals_map.template head<2>() = RotationMatrix2D(yaw_mid).transpose() * (p_b - p_a) -
+      p_ab_mid_.cast<T>();
+    residuals_map(2) = NormalizeAngle(turn - static_cast<T>(yaw_ab_radians_));
+    residuals_map = sqrt_information_.template cast<T>() * residuals_map;
+    return true;
+  }
+
+  static ceres::CostFunction * Create(
+    double x_ab, double y_ab, double yaw_ab_radians,
+    const Eigen::Matrix3d & sqrt_information)
+  {
+    return new ceres::AutoDiffCostFunction<OdometryMidpointErrorTerm, 3, 1, 1, 1, 1, 1, 1>(
+      new OdometryMidpointErrorTerm(x_ab, y_ab, yaw_ab_radians, sqrt_information));
+  }
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+private:
+  // The measured position of B relative to A, in the measured midpoint frame.
+  Eigen::Vector2d p_ab_mid_;
+  // The measured orientation of B relative to A.
+  const double yaw_ab_radians_;
+  // The inverse square root of the measurement covariance matrix.
+  const Eigen::Matrix3d sqrt_information_;
+};
+
+/*****************************************************************************/
+/*****************************************************************************/
+/*****************************************************************************/
+
 // Anchors a live sensor extrinsic estimate (x_e, y_e, yaw_e) to a fixed nominal value (usually
 // the TF-derived CAD/mounting value read at startup) with a tight Gaussian prior, so the joint
 // optimization can refine the extrinsic online without it drifting arbitrarily far from the
