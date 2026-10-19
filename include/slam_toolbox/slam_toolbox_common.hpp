@@ -148,6 +148,7 @@ protected:
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::DeserializePoseGraph>> ssDesserialize_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr extrinsic_seed_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr extrinsic_reset_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr pause_sub_;
   // per extrinsic component (x/y, yaw)
   std::vector<rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr> extrinsic_estimate_subs_;
   std::vector<rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr> extrinsic_estimating_pubs_;

@@ -144,6 +144,19 @@ void SlamToolbox::configure()
       pending_extrinsic_seed_ = geometry_msgs::msg::Pose();
       applyExtrinsicSeed();
     });
+  // Set-style counterpart to the pause_new_measurements toggle service: latched,
+  // so repeats are harmless and a restarted slam_toolbox picks up the current
+  // state. Scans keep arriving while paused, so map->odom keeps being stamped.
+  pause_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+    "slam_toolbox/pause", rclcpp::QoS(1).transient_local(),
+    [this](const std_msgs::msg::Bool & msg) {
+      if (msg.data != isPaused(NEW_MEASUREMENTS)) {
+        RCLCPP_INFO(get_logger(), "SlamToolbox: %s",
+          msg.data ? "pause taking new measurements." : "actively taking new measurements.");
+      }
+      state_.set(NEW_MEASUREMENTS, msg.data);
+      this->set_parameter({"paused_new_measurements", msg.data});
+    });
 
   double transform_publish_period = 0.05;
   transform_publish_period =
@@ -620,17 +633,17 @@ bool SlamToolbox::shouldProcessScan(
 {
   scan_ctr_++;
 
+  // we are in a paused mode, reject incomming information
+  if (isPaused(NEW_MEASUREMENTS)) {
+    return false;
+  }
+
   // we give it a pass on the first measurement to get the ball rolling
   if (first_measurement_) {
     last_scan_time_ = scan->header.stamp;
     last_scan_pose_ = sensor_pose;
     first_measurement_ = false;
     return true;
-  }
-
-  // we are in a paused mode, reject incomming information
-  if (isPaused(NEW_MEASUREMENTS)) {
-    return false;
   }
 
   // throttled out
