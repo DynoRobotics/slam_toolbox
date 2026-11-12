@@ -591,6 +591,45 @@ void SMapper::configure(const rclcpp::Node::SharedPtr & node)
   node->get_parameter("loop_closure_move_scan", loop_closure_move_scan);
   mapper_->setParamLoopClosureMoveScan(loop_closure_move_scan);
 
+  bool loop_closure_ridge_edges = false;
+  if (!node->has_parameter("loop_closure_ridge_edges")) {
+    node->declare_parameter("loop_closure_ridge_edges", loop_closure_ridge_edges);
+  }
+  node->get_parameter("loop_closure_ridge_edges", loop_closure_ridge_edges);
+  mapper_->setParamLoopClosureRidgeEdges(loop_closure_ridge_edges);
+
+  bool loop_closure_ridge_peaks = false;
+  if (!node->has_parameter("loop_closure_ridge_peaks")) {
+    node->declare_parameter("loop_closure_ridge_peaks", loop_closure_ridge_peaks);
+  }
+  node->get_parameter("loop_closure_ridge_peaks", loop_closure_ridge_peaks);
+  mapper_->setParamLoopClosureRidgePeaks(loop_closure_ridge_peaks);
+
+  double loop_closure_ridge_peak_min_contrast = 0.05;
+  if (!node->has_parameter("loop_closure_ridge_peak_min_contrast")) {
+    node->declare_parameter(
+      "loop_closure_ridge_peak_min_contrast", loop_closure_ridge_peak_min_contrast);
+  }
+  node->get_parameter(
+    "loop_closure_ridge_peak_min_contrast", loop_closure_ridge_peak_min_contrast);
+  mapper_->setParamLoopClosureRidgePeakMinContrast(loop_closure_ridge_peak_min_contrast);
+
+  double loop_closure_ridge_peak_uniqueness = 2.0;
+  if (!node->has_parameter("loop_closure_ridge_peak_uniqueness")) {
+    node->declare_parameter(
+      "loop_closure_ridge_peak_uniqueness", loop_closure_ridge_peak_uniqueness);
+  }
+  node->get_parameter("loop_closure_ridge_peak_uniqueness", loop_closure_ridge_peak_uniqueness);
+  mapper_->setParamLoopClosureRidgePeakUniqueness(loop_closure_ridge_peak_uniqueness);
+
+  double loop_closure_ridge_peak_max_offset = 1.0;
+  if (!node->has_parameter("loop_closure_ridge_peak_max_offset")) {
+    node->declare_parameter(
+      "loop_closure_ridge_peak_max_offset", loop_closure_ridge_peak_max_offset);
+  }
+  node->get_parameter("loop_closure_ridge_peak_max_offset", loop_closure_ridge_peak_max_offset);
+  mapper_->setParamLoopClosureRidgePeakMaxOffset(loop_closure_ridge_peak_max_offset);
+
   double loop_closure_gate_chi2 = 0.0;
   if (!node->has_parameter("loop_closure_gate_chi2")) {
     node->declare_parameter("loop_closure_gate_chi2", loop_closure_gate_chi2);

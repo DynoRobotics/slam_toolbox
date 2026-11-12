@@ -855,10 +855,46 @@ public:
     kt_int32u rejectedFineResponse = 0;
     kt_int32u rejectedGate = 0;
     kt_int32u accepted = 0;
+    // of those accepted, ridge matches that only constrain heading and across the ridge (L10)
+    kt_int32u acceptedRidge = 0;
+    // of the ridges, those whose response still peaked uniquely along the ridge (L11)
+    kt_int32u acceptedPeak = 0;
     // attempts whose coarse match used the reflector layer
     kt_int32u reflectorsActive = 0;
     // every attempt's coarse response, for choosing the threshold (offline_replay prints them)
     std::vector<kt_double> coarseResponses;
+    // Every attempt in full (diagnostics; offline_replay writes them to <prefix>_gated.csv).
+    struct Attempt
+    {
+      enum Outcome : kt_int32u { kAccepted = 0, kCoarseResponse, kVariance, kFineResponse, kGate };
+      kt_double time = 0.0;
+      kt_int32s scanId = -1;
+      // the chain scan closest to the coarse pose, and its pose at the time of the match
+      kt_int32s chainId = -1;
+      kt_double chainTime = 0.0;
+      Pose2 chainPose;
+      // the search centre (the scan's pose before the match)
+      Pose2 centre;
+      Pose2 coarseMean;
+      Matrix3 coarseCovariance;
+      kt_double coarseResponse = 0.0;
+      kt_double varianceMajor = 0.0;
+      kt_double varianceMinor = 0.0;
+      Pose2 fineMean;
+      kt_double fineResponse = 0.0;
+      kt_bool ridge = false;
+      // L11's peak test along the ridge, when it ran: the best response's height above the
+      // profile's median and the runner-up's (more than kPeakExclusion away), both relative to
+      // the best; the peak's offset from the search centre along the ridge; its width.
+      kt_bool peakTested = false;
+      kt_bool peaked = false;
+      kt_double peakContrast = 0.0;
+      kt_double runnerUpContrast = 0.0;
+      kt_double peakOffset = 0.0;
+      kt_double peakSigma = 0.0;
+      kt_int32u outcome = kAccepted;
+    };
+    std::vector<Attempt> attemptLog;
   };
 
   /**
@@ -898,12 +934,13 @@ public:
    * Gated match of a scan against a chain (REFLECTOR_SLAM.md §5.9): the loop matcher's wide
    * coarse search with the response and variance gates, the sequential matcher's fine match,
    * L2's covariance and L4's consistency gate. Used by loop closure and, with NearChainGated, by
-   * near-chain linking; counts outcomes in rStats.
+   * near-chain linking; counts outcomes in rStats. rRidge: accepted as a ridge match (L10), whose
+   * covariance leaves the position along the ridge free.
    */
   kt_bool MatchChainGated(
     LocalizedRangeScan * pScan, const LocalizedRangeScanVector & rChain,
     kt_double minimumCoarseResponse, kt_double minimumFineResponse, LoopClosureStats & rStats,
-    Pose2 & rMean, Matrix3 & rCovariance);
+    Pose2 & rMean, Matrix3 & rCovariance, kt_bool & rRidge);
 
   /**
    * L4 (REFLECTOR_SLAM.md §5.9): whether a loop closure's correction of the scan agrees with the
@@ -976,6 +1013,21 @@ public:
   inline const LoopClosureStats & GetNearChainStats() const
   {
     return m_NearChainStats;
+  }
+
+  // Wall time (s) spent in each phase since construction, for offline_replay's profiling.
+  // match is inside near and loop; solve is inside loop and the periodic solve.
+  struct PhaseSeconds
+  {
+    double near = 0.0;
+    double loop = 0.0;
+    double match = 0.0;
+    double solve = 0.0;
+    std::size_t nearChains = 0;
+  };
+  inline const PhaseSeconds & GetPhaseSeconds() const
+  {
+    return m_PhaseSeconds;
   }
 
   /**
@@ -1116,6 +1168,7 @@ private:
   kt_int32u m_LinkOrigin = LinkInfo::kOriginSequential;
   LoopClosureStats m_LoopClosureStats;
   LoopClosureStats m_NearChainStats;
+  PhaseSeconds m_PhaseSeconds;
 
   /**
    * Serialization: class MapperGraph
@@ -1772,6 +1825,27 @@ public:
     m_pSurfaceDump = pStream;
   }
 
+  /**
+   * Write each coarse search's position grid to this stream (diagnostics, offline_replay
+   * --loop-surface): a header line "S time centre_x centre_y centre_heading nx ny resolution
+   * x0 y0" (x0, y0 the world position of cell 0,0), then ny lines of nx responses (one per
+   * row of y), each the best over the searched headings. Far smaller than SetSurfaceDump's every
+   * candidate, for the loop matcher's wide searches. nullptr stops.
+   */
+  inline void SetPositionSurfaceDump(std::ostream * pStream)
+  {
+    m_pPositionSurfaceDump = pStream;
+  }
+
+  /**
+   * The last coarse search's best response per position over all headings (cells not searched
+   * hold 0). Valid until the next coarse search.
+   */
+  inline const Grid<kt_double> * GetSearchSpaceProbs() const
+  {
+    return m_pSearchSpaceProbs;
+  }
+
   // Whether the last match, of any kind, used the reflector layer.
   inline kt_bool LastMatchUsedReflectors() const
   {
@@ -1961,6 +2035,7 @@ private:
   ReflectorMatchStats m_LastReflectorStats;
   MatchDiagnostics m_LastMatch;
   std::ostream * m_pSurfaceDump = nullptr;
+  std::ostream * m_pPositionSurfaceDump = nullptr;
   ScoreSource m_ScoreSource = ScoreSource::Combined;
   // Set by EstimateSource: CorrelateScan's coarse pass then also leaves the full covariance here.
   kt_bool m_ComputeFullCovariance = false;
@@ -2902,6 +2977,16 @@ protected:
   Parameter<kt_bool> * m_pLoopClosureCoarseCovariance;
   // ... and whether an accepted closure moves the scan before the solve (stock: true).
   Parameter<kt_bool> * m_pLoopClosureMoveScan;
+  // L10: accept a coarse match that is a ridge (uncertain along one direction only) as an edge
+  // that constrains heading and position across the ridge, instead of rejecting it.
+  Parameter<kt_bool> * m_pLoopClosureRidgeEdges;
+  // L11: a ridge whose response still has one clear peak along it keeps that peak's position
+  // and width instead (minimum contrast, uniqueness ratio over the runner-up, maximum offset
+  // from the search centre).
+  Parameter<kt_bool> * m_pLoopClosureRidgePeaks;
+  Parameter<kt_double> * m_pLoopClosureRidgePeakMinContrast;
+  Parameter<kt_double> * m_pLoopClosureRidgePeakUniqueness;
+  Parameter<kt_double> * m_pLoopClosureRidgePeakMaxOffset;
   // L6: match near chains like loop closures (MatchChainGated).
   Parameter<kt_bool> * m_pNearChainGated;
   Parameter<kt_int32u> * m_pLinkChainScans;
@@ -3028,6 +3113,11 @@ public:
   bool getParamLoopMatchRelativeCovariance();
   bool getParamLoopClosureCoarseCovariance();
   bool getParamLoopClosureMoveScan();
+  bool getParamLoopClosureRidgeEdges();
+  bool getParamLoopClosureRidgePeaks();
+  double getParamLoopClosureRidgePeakMinContrast();
+  double getParamLoopClosureRidgePeakUniqueness();
+  double getParamLoopClosureRidgePeakMaxOffset();
   bool getParamNearChainGated();
   double getParamLoopClosureGateChi2();
   double getParamLoopClosureGateDriftXY();
@@ -3087,6 +3177,11 @@ public:
   void setParamLoopMatchRelativeCovariance(bool b);
   void setParamLoopClosureCoarseCovariance(bool b);
   void setParamLoopClosureMoveScan(bool b);
+  void setParamLoopClosureRidgeEdges(bool b);
+  void setParamLoopClosureRidgePeaks(bool b);
+  void setParamLoopClosureRidgePeakMinContrast(double d);
+  void setParamLoopClosureRidgePeakUniqueness(double d);
+  void setParamLoopClosureRidgePeakMaxOffset(double d);
   void setParamNearChainGated(bool b);
   void setParamLinkChainScans(int n);
   void setParamNearChainMinimumResponseCoarse(double v);

@@ -18,6 +18,7 @@
 
 #include <karto_sdk/Types.h>
 #include <math.h>
+#include <cmath>
 #include <assert.h>
 #include <boost/serialization/vector.hpp>
 #include <sstream>
@@ -903,6 +904,24 @@ kt_double ScanMatcher::CorrelateScan(
       }
 
       *ptr = math::Maximum(m_pPoseResponse[i].first, *ptr);
+    }
+  }
+
+  // Diagnostics: the coarse search's best response per position, over all headings.
+  if (m_pPositionSurfaceDump != nullptr && !doingFineMatch) {
+    std::ostream & out = *m_pPositionSurfaceDump;
+    const kt_int32s nx = m_pSearchSpaceProbs->GetWidth();
+    const kt_int32s ny = m_pSearchSpaceProbs->GetHeight();
+    const Vector2<kt_double> origin = m_pSearchSpaceProbs->GridToWorld(Vector2<kt_int32s>(0, 0));
+    out << "S " << pScan->GetTime() << ' ' << rSearchCenter.GetX() << ' ' <<
+      rSearchCenter.GetY() << ' ' << rSearchCenter.GetHeading() << ' ' << nx << ' ' << ny <<
+      ' ' << m_pSearchSpaceProbs->GetResolution() << ' ' << origin.GetX() << ' ' <<
+      origin.GetY() << '\n';
+    for (kt_int32s y = 0; y < ny; y++) {
+      for (kt_int32s x = 0; x < nx; x++) {
+        out << m_pSearchSpaceProbs->GetDataPointer()[
+          m_pSearchSpaceProbs->GridIndex(Vector2<kt_int32s>(x, y))] << (x + 1 < nx ? ' ' : '\n');
+      }
     }
   }
 
@@ -2254,11 +2273,127 @@ kt_bool MapperGraph::ClosureConsistentWithGraph(
   return d2 <= chi2;
 }
 
+namespace
+{
+
+// L11: the coarse search's response along a ridge (REFLECTOR_SLAM.md §5.9).
+struct RidgePeak
+{
+  kt_bool valid = false;
+  kt_double contrast = 0.0;      // (best - median) / best
+  kt_double runnerUp = 0.0;      // (runner-up - median) / best, runner-up beyond kPeakExclusion
+  kt_double offset = 0.0;        // the best's position along the axis from the search centre (m)
+  kt_double sigma = 0.0;         // the peak's width along the axis (m)
+};
+
+// Positions closer than this to the best belong to its peak; the runner-up is the best beyond.
+constexpr kt_double kPeakExclusion = 0.3;  // m
+// The profile takes, per position along the axis, the best response within this distance
+// across it of the best position.
+constexpr kt_double kPeakBand = 0.1;  // m
+// The peak's width is floored at this: the coarse search samples every other cell.
+constexpr kt_double kPeakSigmaFloor = 0.05;  // m
+
+// The profile of the best-per-position grid along the unit axis (ux, uy) through its best cell.
+RidgePeak AnalyzeRidgePeak(
+  const Grid<kt_double> & rProbs, const Vector2<kt_double> & rCentre, kt_double ux, kt_double uy)
+{
+  RidgePeak peak;
+  const kt_int32s nx = rProbs.GetWidth();
+  const kt_int32s ny = rProbs.GetHeight();
+  const kt_double resolution = rProbs.GetResolution();
+  const kt_double * pData = rProbs.GetDataPointer();
+  struct Cell
+  {
+    kt_double s;
+    kt_double t;
+    kt_double value;
+  };
+  std::vector<Cell> cells;
+  Cell best{0.0, 0.0, 0.0};
+  for (kt_int32s y = 0; y < ny; y++) {
+    for (kt_int32s x = 0; x < nx; x++) {
+      const Vector2<kt_int32s> grid(x, y);
+      const kt_double value = pData[rProbs.GridIndex(grid)];
+      if (value <= 0.0) {
+        continue;  // not searched (the coarse search steps over every other cell)
+      }
+      const Vector2<kt_double> d = rProbs.GridToWorld(grid) - rCentre;
+      const Cell cell{d.GetX() * ux + d.GetY() * uy, -d.GetX() * uy + d.GetY() * ux, value};
+      cells.push_back(cell);
+      if (cell.value > best.value) {
+        best = cell;
+      }
+    }
+  }
+  if (best.value <= 0.0) {
+    return peak;
+  }
+  // Best per position along the axis, within the band across it.
+  std::map<kt_int32s, kt_double> profile;
+  for (const Cell & cell : cells) {
+    if (std::fabs(cell.t - best.t) > kPeakBand) {
+      continue;
+    }
+    kt_double & v = profile[static_cast<kt_int32s>(std::lround(cell.s / resolution))];
+    v = std::max(v, cell.value);
+  }
+  if (profile.size() < 3) {
+    return peak;
+  }
+  std::vector<kt_double> values;
+  for (const auto & bin : profile) {
+    values.push_back(bin.second);
+  }
+  std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
+  const kt_double median = values[values.size() / 2];
+  kt_double runnerUp = median;
+  kt_double weightSum = 0.0;
+  kt_double moment = 0.0;
+  const kt_double halfHeight = median + 0.5 * (best.value - median);
+  for (const auto & bin : profile) {
+    const kt_double s = bin.first * resolution;
+    if (std::fabs(s - best.s) > kPeakExclusion) {
+      runnerUp = std::max(runnerUp, bin.second);
+    } else if (bin.second > halfHeight) {
+      const kt_double w = bin.second - halfHeight;
+      weightSum += w;
+      moment += w * (s - best.s) * (s - best.s);
+    }
+  }
+  peak.valid = true;
+  peak.contrast = (best.value - median) / best.value;
+  peak.runnerUp = (runnerUp - median) / best.value;
+  peak.offset = best.s;
+  peak.sigma = std::max(kPeakSigmaFloor, weightSum > 0.0 ? std::sqrt(moment / weightSum) : 0.0);
+  return peak;
+}
+
+}  // namespace
+
+namespace
+{
+// Adds the wall time of its scope to a counter.
+struct ScopedSeconds
+{
+  explicit ScopedSeconds(double & rTotal)
+  : m_rTotal(rTotal), m_Start(std::chrono::steady_clock::now()) {}
+  ~ScopedSeconds()
+  {
+    m_rTotal += std::chrono::duration<double>(std::chrono::steady_clock::now() - m_Start).count();
+  }
+  double & m_rTotal;
+  std::chrono::steady_clock::time_point m_Start;
+};
+}  // namespace
+
 kt_bool MapperGraph::MatchChainGated(
   LocalizedRangeScan * pScan, const LocalizedRangeScanVector & rChain,
   kt_double minimumCoarseResponse, kt_double minimumFineResponse, LoopClosureStats & rStats,
-  Pose2 & rMean, Matrix3 & rCovariance)
+  Pose2 & rMean, Matrix3 & rCovariance, kt_bool & rRidge)
 {
+  const ScopedSeconds timed(m_PhaseSeconds.match);
+  rRidge = false;
   // Coarse: the loop matcher's wide search (with the reflector layer and the ridge-aware
   // covariance when enabled, §5.9 L1/L5), gated on response and variance.
   Matrix3 covariance;
@@ -2266,6 +2401,24 @@ kt_bool MapperGraph::MatchChainGated(
       covariance, false, false);
   const Matrix3 coarseCovariance = covariance;
   ++rStats.attempts;
+  LoopClosureStats::Attempt attempt;
+  attempt.time = pScan->GetTime();
+  attempt.scanId = pScan->GetUniqueId();
+  attempt.centre = pScan->GetSensorPose();
+  attempt.coarseMean = rMean;
+  attempt.coarseCovariance = coarseCovariance;
+  attempt.coarseResponse = coarseResponse;
+  if (const LocalizedRangeScan * pClosest = GetClosestScanToPose(rChain, rMean)) {
+    attempt.chainId = pClosest->GetUniqueId();
+    attempt.chainTime = pClosest->GetTime();
+    attempt.chainPose = pClosest->GetSensorPose();
+  }
+  // Logs the attempt with its outcome; every return below goes through it.
+  const auto finish = [&](kt_int32u outcome) {
+      attempt.outcome = outcome;
+      attempt.ridge = rRidge;
+      rStats.attemptLog.push_back(attempt);
+    };
   rStats.coarseResponses.push_back(coarseResponse);
   if (m_pLoopScanMatcher->LastMatchUsedReflectors()) {
     ++rStats.reflectorsActive;
@@ -2280,12 +2433,75 @@ kt_bool MapperGraph::MatchChainGated(
 
   if (coarseResponse <= minimumCoarseResponse) {
     ++rStats.rejectedCoarseResponse;
+    finish(LoopClosureStats::Attempt::kCoarseResponse);
     return false;
   }
-  if (covariance(0, 0) >= m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue() ||
-    covariance(1, 1) >= m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue())
-  {
+  const kt_double maximumVariance = m_pMapper->m_pLoopMatchMaximumVarianceCoarse->GetValue();
+  // The position covariance's principal axes: in a featureless corridor the coarse match is a
+  // ridge, long along the corridor and tight across it.
+  const kt_double halfTrace = 0.5 * (covariance(0, 0) + covariance(1, 1));
+  const kt_double halfDiff = 0.5 * (covariance(0, 0) - covariance(1, 1));
+  const kt_double radius = std::sqrt(halfDiff * halfDiff + covariance(0, 1) * covariance(0, 1));
+  const kt_double varianceMajor = halfTrace + radius;
+  const kt_double varianceMinor = halfTrace - radius;
+  attempt.varianceMajor = varianceMajor;
+  attempt.varianceMinor = varianceMinor;
+  // The major axis (unit): along the corridor for a ridge.
+  kt_double axisX = 1.0;
+  kt_double axisY = 0.0;
+  if (std::fabs(covariance(0, 1)) > 1e-12) {
+    axisX = varianceMajor - covariance(1, 1);
+    axisY = covariance(0, 1);
+    const kt_double norm = std::hypot(axisX, axisY);
+    axisX /= norm;
+    axisY /= norm;
+  } else if (covariance(1, 1) > covariance(0, 0)) {
+    axisX = 0.0;
+    axisY = 1.0;
+  }
+  // The coarse covariance the edge keeps (L2); L11 may narrow it along the axis.
+  Matrix3 edgeCoarseCovariance = coarseCovariance;
+  if (m_pMapper->m_pLoopClosureRidgeEdges->GetValue()) {
+    // L10 (REFLECTOR_SLAM.md §5.9): reject only when no direction is pinned; a ridge still
+    // fixes the heading and the position across it.
+    if (varianceMinor >= maximumVariance) {
+      ++rStats.rejectedVariance;
+      finish(LoopClosureStats::Attempt::kVariance);
+      return false;
+    }
+    rRidge = varianceMajor >= maximumVariance;
+    // L11: the window-wide covariance counts every position scoring within a fixed fraction
+    // of the best, so a peak standing a few percent above a long plateau (the corridor's end
+    // wall) still reads as a ridge. Look at the profile along the ridge itself: one clear,
+    // unique peak near the search centre pins the position along it after all.
+    const Grid<kt_double> * pProbs = m_pLoopScanMatcher->GetSearchSpaceProbs();
+    if (rRidge && m_pMapper->m_pLoopClosureRidgePeaks->GetValue() && pProbs != nullptr) {
+      const RidgePeak peak = AnalyzeRidgePeak(
+        *pProbs, attempt.centre.GetPosition(), axisX, axisY);
+      attempt.peakTested = peak.valid;
+      attempt.peakContrast = peak.contrast;
+      attempt.runnerUpContrast = peak.runnerUp;
+      attempt.peakOffset = peak.offset;
+      attempt.peakSigma = peak.sigma;
+      const kt_bool peaked = peak.valid &&
+        peak.contrast >= m_pMapper->m_pLoopClosureRidgePeakMinContrast->GetValue() &&
+        peak.contrast >= m_pMapper->m_pLoopClosureRidgePeakUniqueness->GetValue() *
+        std::max(peak.runnerUp, 0.0) &&
+        std::fabs(peak.offset) <= m_pMapper->m_pLoopClosureRidgePeakMaxOffset->GetValue();
+      attempt.peaked = peaked;
+      if (peaked) {
+        // Replace the variance along the axis by the peak's width.
+        const kt_double shrink = varianceMajor - peak.sigma * peak.sigma;
+        edgeCoarseCovariance(0, 0) -= shrink * axisX * axisX;
+        edgeCoarseCovariance(0, 1) -= shrink * axisX * axisY;
+        edgeCoarseCovariance(1, 0) -= shrink * axisX * axisY;
+        edgeCoarseCovariance(1, 1) -= shrink * axisY * axisY;
+        rRidge = false;
+      }
+    }
+  } else if (covariance(0, 0) >= maximumVariance || covariance(1, 1) >= maximumVariance) {
     ++rStats.rejectedVariance;
+    finish(LoopClosureStats::Attempt::kVariance);
     return false;
   }
 
@@ -2303,6 +2519,8 @@ kt_bool MapperGraph::MatchChainGated(
   tmpScan.SetSensorPose(rMean);    // This also updates OdometricPose.
   const kt_double fineResponse = m_pMapper->m_pSequentialScanMatcher->MatchScan(&tmpScan,
       rChain, rMean, covariance, false);
+  attempt.fineMean = rMean;
+  attempt.fineResponse = fineResponse;
 
   std::stringstream stream1;
   stream1 << "FINE RESPONSE: " << fineResponse << " (>" << minimumFineResponse << ")" <<
@@ -2312,26 +2530,49 @@ kt_bool MapperGraph::MatchChainGated(
   // L2: the fine match only sees +-half a coarse step, so its covariance cannot show the coarse
   // search's ambiguity (a ridge along a corridor); keep both.
   if (m_pMapper->m_pLoopClosureCoarseCovariance->GetValue()) {
-    covariance += coarseCovariance;
+    covariance += edgeCoarseCovariance;
+  }
+  if (rRidge) {
+    // L10: the position along the ridge is whatever the search window happened to hold, so the
+    // edge must not pull on it. Add a variance along the ridge's axis far beyond any search
+    // window; the heading and the position across the ridge keep their own. LinkInfo rotates
+    // this map-frame covariance into the edge's frame, and ComputeWeightedMean weights by its
+    // inverse, so neither the solve nor the scan's pose is moved along the ridge.
+    constexpr kt_double kRidgeVariance = 100.0;  // m^2
+    covariance(0, 0) += kRidgeVariance * axisX * axisX;
+    covariance(0, 1) += kRidgeVariance * axisX * axisY;
+    covariance(1, 0) += kRidgeVariance * axisX * axisY;
+    covariance(1, 1) += kRidgeVariance * axisY * axisY;
   }
   rCovariance = PositiveDefinite(covariance);
 
   if (fineResponse < minimumFineResponse) {
     ++rStats.rejectedFineResponse;
     m_pMapper->FireLoopClosureCheck("REJECTED!");
+    finish(LoopClosureStats::Attempt::kFineResponse);
     return false;
   }
   if (!ClosureConsistentWithGraph(rChain, pScan, rMean, rCovariance)) {
     ++rStats.rejectedGate;
     m_pMapper->FireLoopClosureCheck("REJECTED by the consistency gate");
+    finish(LoopClosureStats::Attempt::kGate);
     return false;
   }
   ++rStats.accepted;
+  finish(LoopClosureStats::Attempt::kAccepted);
+  if (attempt.peaked) {
+    ++rStats.acceptedPeak;
+  }
+  if (rRidge) {
+    ++rStats.acceptedRidge;
+    m_pMapper->FireLoopClosureCheck("ACCEPTED as a ridge: heading and across it only");
+  }
   return true;
 }
 
 kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSensorName)
 {
+  const ScopedSeconds timed(m_PhaseSeconds.loop);
   kt_bool loopClosed = false;
 
   kt_int32u scanIndex = 0;
@@ -2341,16 +2582,18 @@ kt_bool MapperGraph::TryCloseLoop(LocalizedRangeScan * pScan, const Name & rSens
   while (!candidateChain.empty()) {
     Pose2 bestPose;
     Matrix3 covariance;
+    kt_bool ridge = false;
     if (MatchChainGated(pScan, candidateChain,
       m_pMapper->m_pLoopMatchMinimumResponseCoarse->GetValue(),
       m_pMapper->m_pLoopMatchMinimumResponseFine->GetValue(), m_LoopClosureStats, bestPose,
-      covariance))
+      covariance, ridge))
     {
       m_pMapper->FireBeginLoopClosure("Closing loop...");
 
       // Stock Karto moves the scan to the closure pose before the solve, so the online pose
       // jumps by the full correction however uncertain the closure; off, the solve decides.
-      if (m_pMapper->m_pLoopClosureMoveScan->GetValue()) {
+      // Never for a ridge match, whose position along the ridge is arbitrary (L10).
+      if (m_pMapper->m_pLoopClosureMoveScan->GetValue() && !ridge) {
         pScan->SetSensorPose(bestPose);
       }
       m_LinkOrigin = LinkInfo::kOriginLoopClosure;
@@ -2475,8 +2718,10 @@ void MapperGraph::LinkNearChains(
   LocalizedRangeScan * pScan, Pose2Vector & rMeans,
   std::vector<Matrix3> & rCovariances)
 {
+  const ScopedSeconds timed(m_PhaseSeconds.near);
   m_LinkOrigin = LinkInfo::kOriginNearChain;
   const std::vector<LocalizedRangeScanVector> nearChains = FindNearChains(pScan);
+  m_PhaseSeconds.nearChains += nearChains.size();
   const_forEach(std::vector<LocalizedRangeScanVector>, &nearChains)
   {
     if (iter->size() < m_pMapper->m_pLoopMatchMinimumChainSize->GetValue()) {
@@ -2486,6 +2731,7 @@ void MapperGraph::LinkNearChains(
     Pose2 mean;
     Matrix3 covariance;
     kt_bool link = false;
+    kt_bool ridge = false;
     if (m_pMapper->m_pNearChainGated->GetValue()) {
       // L6 (REFLECTOR_SLAM.md §5.9): the sequential matcher only searches +-half its window
       // around the current, possibly drifted pose, so in a featureless corridor it confirms
@@ -2493,7 +2739,7 @@ void MapperGraph::LinkNearChains(
       link = MatchChainGated(pScan, *iter,
           m_pMapper->m_pNearChainMinimumResponseCoarse->GetValue(),
           m_pMapper->m_pLinkMatchMinimumResponseFine->GetValue() - KT_TOLERANCE,
-          m_NearChainStats, mean, covariance);
+          m_NearChainStats, mean, covariance, ridge);
     } else {
       // match scan against "near" chain
       kt_double response = m_pMapper->m_pSequentialScanMatcher->MatchScan(pScan, *iter, mean,
@@ -2952,6 +3198,7 @@ LocalizedRangeScanVector MapperGraph::FindPossibleLoopClosure(
 
 void MapperGraph::CorrectPoses()
 {
+  const ScopedSeconds timed(m_PhaseSeconds.solve);
   // optimize scans!
   ScanSolver * pSolver = m_pMapper->m_pScanOptimizer;
   if (pSolver != NULL) {
@@ -3353,6 +3600,31 @@ void Mapper::InitializeParameters()
     "Whether an accepted closure moves the scan before the solve.",
     true, GetParameterManager());
 
+  m_pLoopClosureRidgeEdges = new Parameter<kt_bool>(
+    "LoopClosureRidgeEdges",
+    "Accept a ridge match as an edge constraining heading and across the ridge only.",
+    false, GetParameterManager());
+
+  m_pLoopClosureRidgePeaks = new Parameter<kt_bool>(
+    "LoopClosureRidgePeaks",
+    "Keep a ridge's unique peak along it as the position along the ridge.",
+    false, GetParameterManager());
+
+  m_pLoopClosureRidgePeakMinContrast = new Parameter<kt_double>(
+    "LoopClosureRidgePeakMinContrast",
+    "Minimum (best - median) / best along the ridge for a peak.",
+    0.05, GetParameterManager());
+
+  m_pLoopClosureRidgePeakUniqueness = new Parameter<kt_double>(
+    "LoopClosureRidgePeakUniqueness",
+    "How many times the runner-up's height above the median the peak must stand.",
+    2.0, GetParameterManager());
+
+  m_pLoopClosureRidgePeakMaxOffset = new Parameter<kt_double>(
+    "LoopClosureRidgePeakMaxOffset",
+    "Maximum distance of the peak from the search centre along the ridge (m).",
+    1.0, GetParameterManager());
+
   m_pLoopClosureGateChi2 = new Parameter<kt_double>(
     "LoopClosureGateChi2",
     "chi^2 gate of a closure against the current graph; 0 disables it.",
@@ -3672,6 +3944,31 @@ bool Mapper::getParamLoopClosureMoveScan()
   return static_cast<bool>(m_pLoopClosureMoveScan->GetValue());
 }
 
+bool Mapper::getParamLoopClosureRidgeEdges()
+{
+  return static_cast<bool>(m_pLoopClosureRidgeEdges->GetValue());
+}
+
+bool Mapper::getParamLoopClosureRidgePeaks()
+{
+  return static_cast<bool>(m_pLoopClosureRidgePeaks->GetValue());
+}
+
+double Mapper::getParamLoopClosureRidgePeakMinContrast()
+{
+  return static_cast<double>(m_pLoopClosureRidgePeakMinContrast->GetValue());
+}
+
+double Mapper::getParamLoopClosureRidgePeakUniqueness()
+{
+  return static_cast<double>(m_pLoopClosureRidgePeakUniqueness->GetValue());
+}
+
+double Mapper::getParamLoopClosureRidgePeakMaxOffset()
+{
+  return static_cast<double>(m_pLoopClosureRidgePeakMaxOffset->GetValue());
+}
+
 double Mapper::getParamLoopClosureGateChi2()
 {
   return static_cast<double>(m_pLoopClosureGateChi2->GetValue());
@@ -3981,6 +4278,31 @@ void Mapper::setParamNearChainGated(bool b)
 void Mapper::setParamLoopClosureMoveScan(bool b)
 {
   m_pLoopClosureMoveScan->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureRidgeEdges(bool b)
+{
+  m_pLoopClosureRidgeEdges->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureRidgePeaks(bool b)
+{
+  m_pLoopClosureRidgePeaks->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamLoopClosureRidgePeakMinContrast(double d)
+{
+  m_pLoopClosureRidgePeakMinContrast->SetValue((kt_double)d);
+}
+
+void Mapper::setParamLoopClosureRidgePeakUniqueness(double d)
+{
+  m_pLoopClosureRidgePeakUniqueness->SetValue((kt_double)d);
+}
+
+void Mapper::setParamLoopClosureRidgePeakMaxOffset(double d)
+{
+  m_pLoopClosureRidgePeakMaxOffset->SetValue((kt_double)d);
 }
 
 void Mapper::setParamLoopClosureGateChi2(double d)

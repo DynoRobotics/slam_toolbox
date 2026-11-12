@@ -3,8 +3,8 @@
 // (REFLECTOR_SLAM.md §7).
 //
 // Usage:
-//   offline_replay <bag> <out_prefix> [--save] [--surface <file>] --ros-args --params-file
-//     <slam params> [-p ...]
+//   offline_replay <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>]
+//     --ros-args --params-file <slam params> [-p ...]
 //
 // The bag needs the scan topic (scan_topic, e.g. /scan_filtered) and /tf, /tf_static. Messages
 // are read in bag order; /tf goes straight into the transform buffer, and each scan waits until
@@ -14,7 +14,11 @@
 // the reflector layer did in its sequential match, and
 // with --save also <out_prefix>.posegraph/.data. --surface writes every candidate pose of the
 // sequential matcher's searches to <file> (REFLECTOR_SLAM.md 5.10; scripts/reflector_eval/
-// surface.py reads it).
+// surface.py reads it). --loop-surface writes each coarse search of the loop matcher (loop
+// closures and gated near chains) as a grid of the best response per position
+// (ScanMatcher::SetPositionSurfaceDump). Every gated match attempt goes to
+// <out_prefix>_gated.csv: search centre, coarse mean and covariance before any ridge
+// inflation, fine mean, outcome, and the chain scan it links to.
 
 #include <sys/resource.h>
 
@@ -90,14 +94,23 @@ public:
       while (!pending.empty() &&
         rclcpp::Time(pending.front()->header.stamp, RCL_ROS_TIME) <= odom_until)
       {
-        laserCallback(pending.front());
+        timedCallback(pending.front());
         pending.pop_front();
       }
     }
     for (const auto & scan : pending) {
-      laserCallback(scan);
+      timedCallback(scan);
     }
 
+    {
+      std::ofstream f(out_prefix + "_timing.csv");
+      f << "stamp,seconds,near,loop,match,solve,near_chains\n";
+      for (const auto & c : callback_seconds_) {
+        f << std::fixed << std::setprecision(3) << c.stamp << std::setprecision(4) << ','
+          << c.seconds << ',' << c.near << ',' << c.loop << ',' << c.match << ',' << c.solve
+          << ',' << c.nearChains << '\n';
+      }
+    }
     writePoses(out_prefix + "_poses.csv");
     if (save) {
       serialization::write(out_prefix, *smapper_->getMapper(), *dataset_, shared_from_this());
@@ -112,13 +125,14 @@ public:
       (std::abs(a - b) <= 1 ? sequential : cross)++;
     }
     writeEdges(out_prefix + "_edges.csv");
+    writeGated(out_prefix + "_gated.csv");
     const auto & loops = smapper_->getMapper()->GetGraph()->GetLoopClosureStats();
     RCLCPP_INFO(get_logger(),
       "offline_replay: %zu scans read, %zu processed, %zu without odom, %.1f s, "
-      "edges %zu sequential + %zu cross; loop closures: %u attempts, %u accepted, rejected "
-      "%u coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
+      "edges %zu sequential + %zu cross; loop closures: %u attempts, %u accepted (%u ridge, %u peak), "
+      "rejected %u coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
       scans_read_, online_.size(), no_odom_, seconds, sequential, cross, loops.attempts,
-      loops.accepted, loops.rejectedCoarseResponse, loops.rejectedVariance,
+      loops.accepted, loops.acceptedRidge, loops.acceptedPeak, loops.rejectedCoarseResponse, loops.rejectedVariance,
       loops.rejectedFineResponse, loops.rejectedGate, loops.reflectorsActive);
     logExtrinsics();
     logCoarseResponses("loop closure", loops.coarseResponses);
@@ -126,9 +140,10 @@ public:
     logCoarseResponses("gated near chain", near.coarseResponses);
     if (near.attempts > 0) {
       RCLCPP_INFO(get_logger(),
-        "offline_replay: gated near chains: %u attempts, %u accepted, rejected %u coarse "
-        "response, %u variance, %u fine response, %u gate; reflectors in %u",
-        near.attempts, near.accepted, near.rejectedCoarseResponse, near.rejectedVariance,
+        "offline_replay: gated near chains: %u attempts, %u accepted (%u ridge, %u peak), rejected %u "
+        "coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
+        near.attempts, near.accepted, near.acceptedRidge, near.acceptedPeak,
+        near.rejectedCoarseResponse, near.rejectedVariance,
         near.rejectedFineResponse, near.rejectedGate, near.reflectorsActive);
     }
     return 0;
@@ -159,6 +174,11 @@ protected:
     }
     if (surface_ && smapper_->getMapper()->GetSequentialScanMatcher()) {
       smapper_->getMapper()->GetSequentialScanMatcher()->SetSurfaceDump(surface_.get());
+    }
+    if (loop_surface_ && smapper_->getMapper()->GetGraph() &&
+      smapper_->getMapper()->GetLoopScanMatcher())
+    {
+      smapper_->getMapper()->GetLoopScanMatcher()->SetPositionSurfaceDump(loop_surface_.get());
     }
     karto::LocalizedRangeScan * range_scan = addScan(laser, scan, pose);
     if (range_scan) {
@@ -280,6 +300,37 @@ private:
 
   // Every graph edge: the two scans, what created it, and the measured relative pose (robot
   // frame of the first scan) with its covariance, for scripts/reflector_eval/eval_edges.py.
+  void writeGated(const std::string & path)
+  {
+    FILE * f = std::fopen(path.c_str(), "w");
+    std::fprintf(f,
+      "kind,stamp_ns,scan_id,chain_id,chain_stamp_ns,chain_x,chain_y,chain_yaw,centre_x,"
+      "centre_y,centre_yaw,coarse_x,coarse_y,coarse_yaw,coarse_cxx,coarse_cxy,coarse_cyy,"
+      "coarse_cyaw,coarse_response,variance_major,variance_minor,fine_x,fine_y,fine_yaw,"
+      "fine_response,ridge,outcome,peak_tested,peaked,peak_contrast,runner_up_contrast,"
+      "peak_offset,peak_sigma\n");
+    const auto * graph = smapper_->getMapper()->GetGraph();
+    const std::pair<const char *, const karto::MapperGraph::LoopClosureStats *> kinds[] = {
+      {"loop", &graph->GetLoopClosureStats()}, {"near", &graph->GetNearChainStats()}};
+    for (const auto & [kind, stats] : kinds) {
+      for (const auto & a : stats->attemptLog) {
+        const karto::Matrix3 & c = a.coarseCovariance;
+        std::fprintf(f,
+          "%s,%ld,%d,%d,%ld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6g,%.6g,%.6g,%.6g,"
+          "%.6f,%.6g,%.6g,%.6f,%.6f,%.6f,%.6f,%d,%u,%d,%d,%.5f,%.5f,%.4f,%.4f\n",
+          kind, static_cast<int64_t>(a.time * 1e9), a.scanId, a.chainId,
+          static_cast<int64_t>(a.chainTime * 1e9), a.chainPose.GetX(), a.chainPose.GetY(),
+          a.chainPose.GetHeading(), a.centre.GetX(), a.centre.GetY(), a.centre.GetHeading(),
+          a.coarseMean.GetX(), a.coarseMean.GetY(), a.coarseMean.GetHeading(), c(0, 0),
+          c(0, 1), c(1, 1), c(2, 2), a.coarseResponse, a.varianceMajor, a.varianceMinor,
+          a.fineMean.GetX(), a.fineMean.GetY(), a.fineMean.GetHeading(), a.fineResponse,
+          a.ridge ? 1 : 0, a.outcome, a.peakTested ? 1 : 0, a.peaked ? 1 : 0, a.peakContrast,
+          a.runnerUpContrast, a.peakOffset, a.peakSigma);
+      }
+    }
+    std::fclose(f);
+  }
+
   void writeEdges(const std::string & path)
   {
     FILE * f = std::fopen(path.c_str(), "w");
@@ -305,9 +356,34 @@ private:
 
 public:
   std::unique_ptr<std::ofstream> surface_;
+  std::unique_ptr<std::ofstream> loop_surface_;
 
 private:
   std::size_t scans_read_{0};
+  // Wall time of each callback that added a scan (the live node's blocked-callback time).
+  // With the time in each phase (karto::MapperGraph::PhaseSeconds) during that callback.
+  struct CallbackTiming
+  {
+    double stamp, seconds, near, loop, match, solve;
+    std::size_t nearChains;
+  };
+  std::vector<CallbackTiming> callback_seconds_;
+
+  void timedCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan)
+  {
+    const std::size_t before = online_.size();
+    const auto * graph = smapper_->getMapper()->GetGraph();
+    const auto p0 = graph ? graph->GetPhaseSeconds() : karto::MapperGraph::PhaseSeconds{};
+    const auto t0 = std::chrono::steady_clock::now();
+    laserCallback(scan);
+    if (online_.size() != before) {
+      const auto & p1 = smapper_->getMapper()->GetGraph()->GetPhaseSeconds();
+      callback_seconds_.push_back({rclcpp::Time(scan->header.stamp).seconds(),
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+          p1.near - p0.near, p1.loop - p0.loop, p1.match - p0.match, p1.solve - p0.solve,
+          p1.nearChains - p0.nearChains});
+    }
+  }
   std::size_t no_odom_{0};
 };
 
@@ -318,16 +394,20 @@ int main(int argc, char ** argv)
   const auto args = rclcpp::init_and_remove_ros_arguments(argc, argv);
   if (args.size() < 3) {
     std::fprintf(stderr,
-      "Usage: %s <bag> <out_prefix> [--save] [--surface <file>] --ros-args ...\n", argv[0]);
+      "Usage: %s <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>] "
+      "--ros-args ...\n", argv[0]);
     return 1;
   }
   bool save = false;
   std::string surface;
+  std::string loop_surface;
   for (std::size_t i = 3; i < args.size(); i++) {
     if (args[i] == "--save") {
       save = true;
     } else if (args[i] == "--surface" && i + 1 < args.size()) {
       surface = args[++i];
+    } else if (args[i] == "--loop-surface" && i + 1 < args.size()) {
+      loop_surface = args[++i];
     }
   }
 
@@ -346,7 +426,18 @@ int main(int argc, char ** argv)
     node->surface_ = std::make_unique<std::ofstream>(surface);
     *node->surface_ << std::setprecision(9);
   }
+  if (!loop_surface.empty()) {
+    node->loop_surface_ = std::make_unique<std::ofstream>(loop_surface);
+    *node->loop_surface_ << std::setprecision(6);
+  }
   const int result = node->run(args[1], args[2], save);
+  // std::_Exit below skips the streams' destructors; flush them here.
+  if (node->surface_) {
+    node->surface_->flush();
+  }
+  if (node->loop_surface_) {
+    node->loop_surface_->flush();
+  }
   rclcpp::shutdown();
   // Everything is written and closed. Tearing the node down can race the base class's worker
   // threads ("pure virtual method called" from a half-destroyed OfflineReplay), so skip it.
