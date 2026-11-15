@@ -577,12 +577,33 @@ void SMapper::configure(const rclcpp::Node::SharedPtr & node)
   node->get_parameter("link_chain_scans", link_chain_scans);
   mapper_->setParamLinkChainScans(link_chain_scans);
 
+  double link_chain_spread_distance = 0.0;
+  if (!node->has_parameter("link_chain_spread_distance")) {
+    node->declare_parameter("link_chain_spread_distance", link_chain_spread_distance);
+  }
+  node->get_parameter("link_chain_spread_distance", link_chain_spread_distance);
+  mapper_->setParamLinkChainSpreadDistance(link_chain_spread_distance);
+
   bool near_chain_gated = false;
   if (!node->has_parameter("near_chain_gated")) {
     node->declare_parameter("near_chain_gated", near_chain_gated);
   }
   node->get_parameter("near_chain_gated", near_chain_gated);
   mapper_->setParamNearChainGated(near_chain_gated);
+
+  double near_chain_relink_distance = 0.0;
+  if (!node->has_parameter("near_chain_relink_distance")) {
+    node->declare_parameter("near_chain_relink_distance", near_chain_relink_distance);
+  }
+  node->get_parameter("near_chain_relink_distance", near_chain_relink_distance);
+  mapper_->setParamNearChainRelinkDistance(near_chain_relink_distance);
+
+  int near_chain_max_per_scan = 0;
+  if (!node->has_parameter("near_chain_max_per_scan")) {
+    node->declare_parameter("near_chain_max_per_scan", near_chain_max_per_scan);
+  }
+  node->get_parameter("near_chain_max_per_scan", near_chain_max_per_scan);
+  mapper_->setParamNearChainMaxPerScan(near_chain_max_per_scan);
 
   bool loop_closure_move_scan = true;
   if (!node->has_parameter("loop_closure_move_scan")) {

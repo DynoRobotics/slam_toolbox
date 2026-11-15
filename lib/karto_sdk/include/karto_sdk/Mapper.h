@@ -24,6 +24,7 @@
 #include <queue>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <utility>
 #include <string>
 
@@ -859,6 +860,9 @@ public:
     kt_int32u acceptedRidge = 0;
     // of the ridges, those whose response still peaked uniquely along the ridge (L11)
     kt_int32u acceptedPeak = 0;
+    // near chains not matched (L12): linked too recently, or over the per-scan cap
+    kt_int32u throttled = 0;
+    kt_int32u capped = 0;
     // attempts whose coarse match used the reflector layer
     kt_int32u reflectorsActive = 0;
     // every attempt's coarse response, for choosing the threshold (offline_replay prints them)
@@ -1024,6 +1028,7 @@ public:
     double match = 0.0;
     double solve = 0.0;
     std::size_t nearChains = 0;
+    std::size_t nearChainsMatched = 0;
   };
   inline const PhaseSeconds & GetPhaseSeconds() const
   {
@@ -1084,6 +1089,10 @@ private:
    * @param rMeans
    * @param rCovariances
    */
+  // L12: the near chains to match for this scan (throttle and cap; all of them when both are off).
+  std::vector<const LocalizedRangeScanVector *> SelectNearChains(
+    LocalizedRangeScan * pScan, const std::vector<LocalizedRangeScanVector> & rNearChains);
+
   void LinkNearChains(
     LocalizedRangeScan * pScan, Pose2Vector & rMeans,
     std::vector<Matrix3> & rCovariances);
@@ -1169,6 +1178,19 @@ private:
   LoopClosureStats m_LoopClosureStats;
   LoopClosureStats m_NearChainStats;
   PhaseSeconds m_PhaseSeconds;
+
+  // L12 near-chain throttle (REFLECTOR_SLAM.md §5.9). Path length of the added scans' odometric
+  // poses, and per earlier scan the path length at the last match against a chain it was the
+  // closest scan of. Not serialized: after a load every chain is simply due again.
+  struct NearChainAttempt
+  {
+    kt_double lastAttempt = -std::numeric_limits<kt_double>::infinity();
+    kt_double lastAccepted = -std::numeric_limits<kt_double>::infinity();
+  };
+  std::unordered_map<kt_int32s, NearChainAttempt> m_NearChainAttempts;
+  kt_double m_DistanceDriven = 0.0;
+  kt_bool m_HasLastNearChainPose = false;
+  Pose2 m_LastNearChainPose;
 
   /**
    * Serialization: class MapperGraph
@@ -2990,7 +3012,14 @@ protected:
   // L6: match near chains like loop closures (MatchChainGated).
   Parameter<kt_bool> * m_pNearChainGated;
   Parameter<kt_int32u> * m_pLinkChainScans;
+  // L14: spread a chain match's LinkChainScans edges over +-this path length (m) of the chain;
+  // 0: the closest scans.
+  Parameter<kt_double> * m_pLinkChainSpreadDistance;
   Parameter<kt_double> * m_pNearChainMinimumResponseCoarse;
+  // L12: skip a near chain matched and accepted less than this path length ago (m); 0: never.
+  Parameter<kt_double> * m_pNearChainRelinkDistance;
+  // L12: match at most this many near chains per scan, longest unattempted first; 0: no cap.
+  Parameter<kt_int32u> * m_pNearChainMaxPerScan;
   // Stage 6 (REFLECTOR_SLAM.md 5.10): odometry prior.
   Parameter<kt_bool> * m_pOdometryPriorFusion;
   Parameter<kt_double> * m_pOdometryPriorStddevXyPerMeter;
@@ -3119,6 +3148,8 @@ public:
   double getParamLoopClosureRidgePeakUniqueness();
   double getParamLoopClosureRidgePeakMaxOffset();
   bool getParamNearChainGated();
+  double getParamNearChainRelinkDistance();
+  int getParamNearChainMaxPerScan();
   double getParamLoopClosureGateChi2();
   double getParamLoopClosureGateDriftXY();
   double getParamLoopClosureGateDriftYaw();
@@ -3183,7 +3214,10 @@ public:
   void setParamLoopClosureRidgePeakUniqueness(double d);
   void setParamLoopClosureRidgePeakMaxOffset(double d);
   void setParamNearChainGated(bool b);
+  void setParamNearChainRelinkDistance(double d);
+  void setParamNearChainMaxPerScan(int n);
   void setParamLinkChainScans(int n);
+  void setParamLinkChainSpreadDistance(double d);
   void setParamNearChainMinimumResponseCoarse(double v);
   void setParamOdometryPriorFusion(bool v);
   void setParamOdometryPriorStddevXyPerMeter(double v);

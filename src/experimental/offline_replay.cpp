@@ -104,11 +104,11 @@ public:
 
     {
       std::ofstream f(out_prefix + "_timing.csv");
-      f << "stamp,seconds,near,loop,match,solve,near_chains\n";
+      f << "stamp,seconds,near,loop,match,solve,near_chains,near_chains_matched\n";
       for (const auto & c : callback_seconds_) {
         f << std::fixed << std::setprecision(3) << c.stamp << std::setprecision(4) << ','
           << c.seconds << ',' << c.near << ',' << c.loop << ',' << c.match << ',' << c.solve
-          << ',' << c.nearChains << '\n';
+          << ',' << c.nearChains << ',' << c.nearChainsMatched << '\n';
       }
     }
     writePoses(out_prefix + "_poses.csv");
@@ -141,10 +141,12 @@ public:
     if (near.attempts > 0) {
       RCLCPP_INFO(get_logger(),
         "offline_replay: gated near chains: %u attempts, %u accepted (%u ridge, %u peak), rejected %u "
-        "coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
+        "coarse response, %u variance, %u fine response, %u gate; reflectors in %u; not matched "
+        "%u throttled, %u capped",
         near.attempts, near.accepted, near.acceptedRidge, near.acceptedPeak,
         near.rejectedCoarseResponse, near.rejectedVariance,
-        near.rejectedFineResponse, near.rejectedGate, near.reflectorsActive);
+        near.rejectedFineResponse, near.rejectedGate, near.reflectorsActive,
+        near.throttled, near.capped);
     }
     return 0;
   }
@@ -365,7 +367,7 @@ private:
   struct CallbackTiming
   {
     double stamp, seconds, near, loop, match, solve;
-    std::size_t nearChains;
+    std::size_t nearChains, nearChainsMatched;
   };
   std::vector<CallbackTiming> callback_seconds_;
 
@@ -381,7 +383,7 @@ private:
       callback_seconds_.push_back({rclcpp::Time(scan->header.stamp).seconds(),
           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
           p1.near - p0.near, p1.loop - p0.loop, p1.match - p0.match, p1.solve - p0.solve,
-          p1.nearChains - p0.nearChains});
+          p1.nearChains - p0.nearChains, p1.nearChainsMatched - p0.nearChainsMatched});
     }
   }
   std::size_t no_odom_{0};

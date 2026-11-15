@@ -2722,12 +2722,10 @@ void MapperGraph::LinkNearChains(
   m_LinkOrigin = LinkInfo::kOriginNearChain;
   const std::vector<LocalizedRangeScanVector> nearChains = FindNearChains(pScan);
   m_PhaseSeconds.nearChains += nearChains.size();
-  const_forEach(std::vector<LocalizedRangeScanVector>, &nearChains)
-  {
-    if (iter->size() < m_pMapper->m_pLoopMatchMinimumChainSize->GetValue()) {
-      continue;
-    }
-
+  const std::vector<const LocalizedRangeScanVector *> selected = SelectNearChains(pScan, nearChains);
+  m_PhaseSeconds.nearChainsMatched += selected.size();
+  const Pose2 scanPose = pScan->GetReferencePose(m_pMapper->m_pUseScanBarycenter->GetValue());
+  for (const LocalizedRangeScanVector * iter : selected) {
     Pose2 mean;
     Matrix3 covariance;
     kt_bool link = false;
@@ -2746,12 +2744,88 @@ void MapperGraph::LinkNearChains(
           covariance, false);
       link = response > m_pMapper->m_pLinkMatchMinimumResponseFine->GetValue() - KT_TOLERANCE;
     }
+    // L12: remember the attempt on the chain's closest scan; the next chain from the same pass
+    // overlaps this one, so SelectNearChains finds it there.
+    const LocalizedRangeScan * pClosest = GetClosestScanToPose(*iter, scanPose);
+    if (pClosest != NULL) {
+      NearChainAttempt & rAttempt = m_NearChainAttempts[pClosest->GetUniqueId()];
+      rAttempt.lastAttempt = m_DistanceDriven;
+      if (link) {
+        rAttempt.lastAccepted = m_DistanceDriven;
+      }
+    }
     if (link) {
       rMeans.push_back(mean);
       rCovariances.push_back(covariance);
       LinkChainToScan(*iter, pScan, mean, covariance);
     }
   }
+}
+
+std::vector<const LocalizedRangeScanVector *> MapperGraph::SelectNearChains(
+  LocalizedRangeScan * pScan, const std::vector<LocalizedRangeScanVector> & rNearChains)
+{
+  // L12 (REFLECTOR_SLAM.md §5.9): every accepted near-chain edge makes more earlier passes
+  // reachable for FindNearChains, so matching every chain on every scan grows without bound
+  // with the passes over a spot. Skip a chain this pass is already linked to within
+  // relinkDistance of path (a rejection does not count, so it is retried next scan), and match
+  // at most maxPerScan of the rest, longest since their last attempt first: the selection
+  // rotates through every pass, the oldest included, and one that keeps failing goes to the
+  // back after each try.
+  const Pose2 odometricPose = pScan->GetOdometricPose();
+  if (m_HasLastNearChainPose) {
+    m_DistanceDriven += odometricPose.GetPosition().Distance(m_LastNearChainPose.GetPosition());
+  }
+  m_LastNearChainPose = odometricPose;
+  m_HasLastNearChainPose = true;
+
+  const kt_double relinkDistance = m_pMapper->m_pNearChainRelinkDistance->GetValue();
+  const kt_int32u maxPerScan = m_pMapper->m_pNearChainMaxPerScan->GetValue();
+  const kt_int32u minimumChainSize = m_pMapper->m_pLoopMatchMinimumChainSize->GetValue();
+
+  struct Candidate
+  {
+    const LocalizedRangeScanVector * pChain;
+    kt_double sinceAttempt;
+    kt_int32s firstStateId;
+  };
+  std::vector<Candidate> due;
+  for (const LocalizedRangeScanVector & rChain : rNearChains) {
+    if (rChain.size() < minimumChainSize) {
+      continue;
+    }
+    NearChainAttempt last;
+    for (const LocalizedRangeScan * pChainScan : rChain) {
+      const auto found = m_NearChainAttempts.find(pChainScan->GetUniqueId());
+      if (found != m_NearChainAttempts.end()) {
+        last.lastAttempt = std::max(last.lastAttempt, found->second.lastAttempt);
+        last.lastAccepted = std::max(last.lastAccepted, found->second.lastAccepted);
+      }
+    }
+    if (relinkDistance > 0.0 && m_DistanceDriven - last.lastAccepted < relinkDistance) {
+      ++m_NearChainStats.throttled;
+      continue;
+    }
+    due.push_back({&rChain, m_DistanceDriven - last.lastAttempt, rChain.front()->GetStateId()});
+  }
+
+  if (maxPerScan > 0 && due.size() > maxPerScan) {
+    std::stable_sort(due.begin(), due.end(), [](const Candidate & a, const Candidate & b) {
+        if (a.sinceAttempt != b.sinceAttempt) {
+          return a.sinceAttempt > b.sinceAttempt;
+        }
+        return a.firstStateId < b.firstStateId;
+      });
+    m_NearChainStats.capped += static_cast<kt_int32u>(due.size() - maxPerScan);
+    due.resize(maxPerScan);
+  }
+
+  std::vector<const LocalizedRangeScanVector *> selected;
+  selected.reserve(due.size());
+  for (const Candidate & rCandidate : due) {
+    selected.push_back(rCandidate.pChain);
+  }
+  return selected;
 }
 
 void MapperGraph::LinkChainToScan(
@@ -2822,12 +2896,64 @@ void MapperGraph::LinkChainToScanSpread(
       candidates.emplace_back(squaredDistance, pCandidate);
     }
   }
-  const size_t n = std::min<size_t>(chainScans, candidates.size());
-  if (n == 0) {
+  if (candidates.empty()) {
     return;
   }
-  std::partial_sort(candidates.begin(), candidates.begin() + n, candidates.end(),
-    [](const auto & a, const auto & b) {return a.first < b.first;});
+
+  std::vector<LocalizedRangeScan *> chosen;
+  const kt_double spread = m_pMapper->m_pLinkChainSpreadDistance->GetValue();
+  if (spread > 0.0 && chainScans > 1) {
+    // L14: the closest scan plus the others spaced evenly within +-spread of it along the
+    // chain (path length over its reference poses, clamped to the chain's ends). The match was
+    // made against this whole stretch, so attach it there: the n closest are neighbours a node
+    // apart, which barely constrain the earlier pass's heading, and with matches throttled
+    // (L12) leave most of it reached only through its sequential edges.
+    std::vector<kt_double> arc(rChain.size(), 0.0);
+    size_t closestIndex = 0;
+    for (size_t i = 0; i < rChain.size(); i++) {
+      if (i > 0) {
+        arc[i] = arc[i - 1] + rChain[i]->GetReferencePose(barycenter).GetPosition().Distance(
+          rChain[i - 1]->GetReferencePose(barycenter).GetPosition());
+      }
+      if (rChain[i] == pClosest) {
+        closestIndex = i;
+      }
+    }
+    std::set<const LocalizedRangeScan *> eligible;
+    for (const auto & rCandidate : candidates) {
+      eligible.insert(rCandidate.second);
+    }
+    chosen.push_back(pClosest);
+    for (kt_int32u k = 0; k < chainScans; k++) {
+      const kt_double target = arc[closestIndex] - spread +
+        2.0 * spread * static_cast<kt_double>(k) / static_cast<kt_double>(chainScans - 1);
+      if (std::fabs(target - arc[closestIndex]) < KT_TOLERANCE) {
+        continue;
+      }
+      LocalizedRangeScan * pBest = NULL;
+      kt_double bestGap = std::numeric_limits<kt_double>::max();
+      for (size_t i = 0; i < rChain.size(); i++) {
+        const kt_double gap = std::fabs(arc[i] - target);
+        if (gap < bestGap && eligible.count(rChain[i]) > 0 &&
+          std::find(chosen.begin(), chosen.end(), rChain[i]) == chosen.end())
+        {
+          bestGap = gap;
+          pBest = rChain[i];
+        }
+      }
+      if (pBest != NULL && chosen.size() < chainScans) {
+        chosen.push_back(pBest);
+      }
+    }
+  } else {
+    const size_t count = std::min<size_t>(chainScans, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + count, candidates.end(),
+      [](const auto & a, const auto & b) {return a.first < b.first;});
+    for (size_t i = 0; i < count; i++) {
+      chosen.push_back(candidates[i].second);
+    }
+  }
+  const size_t n = chosen.size();
 
   // Each edge with 1/n of the match's information, so together they state it once, plus the
   // lever arm: the scan's position relative to a chain scan d metres away is also off by
@@ -2835,7 +2961,7 @@ void MapperGraph::LinkChainToScanSpread(
   // it the far edges were overconfident and bent the online pose on the loops (§7.2).
   const kt_double headingVariance = rCovariance(2, 2);
   for (size_t i = 0; i < n; i++) {
-    LocalizedRangeScan * pFrom = candidates[i].second;
+    LocalizedRangeScan * pFrom = chosen[i];
     const kt_double rx = rMean.GetX() - pFrom->GetSensorPose().GetX();
     const kt_double ry = rMean.GetY() - pFrom->GetSensorPose().GetY();
     Matrix3 covariance;
@@ -3690,10 +3816,25 @@ void Mapper::InitializeParameters()
     "A chain match is linked to this many of the chain's closest scans (1: the closest only).",
     1, GetParameterManager());
 
+  m_pLinkChainSpreadDistance = new Parameter<kt_double>(
+    "LinkChainSpreadDistance",
+    "Spread a chain match's edges over +-this path length (m) of the chain; 0: the closest scans.",
+    0.0, GetParameterManager());
+
   m_pNearChainGated = new Parameter<kt_bool>(
     "NearChainGated",
     "Match near chains like loop closures (wide coarse search and the loop-closure gates).",
     false, GetParameterManager());
+
+  m_pNearChainRelinkDistance = new Parameter<kt_double>(
+    "NearChainRelinkDistance",
+    "Skip a near chain whose last accepted match is less than this path length back (m); 0: never.",
+    0.0, GetParameterManager());
+
+  m_pNearChainMaxPerScan = new Parameter<kt_int32u>(
+    "NearChainMaxPerScan",
+    "Match at most this many near chains per scan, longest since an attempt first; 0: no cap.",
+    0, GetParameterManager());
 
   m_pLoopClosureGateDriftYaw = new Parameter<kt_double>(
     "LoopClosureGateDriftYaw",
@@ -3937,6 +4078,16 @@ bool Mapper::getParamLoopClosureCoarseCovariance()
 bool Mapper::getParamNearChainGated()
 {
   return static_cast<bool>(m_pNearChainGated->GetValue());
+}
+
+double Mapper::getParamNearChainRelinkDistance()
+{
+  return static_cast<double>(m_pNearChainRelinkDistance->GetValue());
+}
+
+int Mapper::getParamNearChainMaxPerScan()
+{
+  return static_cast<int>(m_pNearChainMaxPerScan->GetValue());
 }
 
 bool Mapper::getParamLoopClosureMoveScan()
@@ -4270,9 +4421,24 @@ void Mapper::setParamLinkChainScans(int n)
   m_pLinkChainScans->SetValue(static_cast<kt_int32u>(std::max(n, 1)));
 }
 
+void Mapper::setParamLinkChainSpreadDistance(double d)
+{
+  m_pLinkChainSpreadDistance->SetValue((kt_double)d);
+}
+
 void Mapper::setParamNearChainGated(bool b)
 {
   m_pNearChainGated->SetValue((kt_bool)b);
+}
+
+void Mapper::setParamNearChainRelinkDistance(double d)
+{
+  m_pNearChainRelinkDistance->SetValue((kt_double)d);
+}
+
+void Mapper::setParamNearChainMaxPerScan(int n)
+{
+  m_pNearChainMaxPerScan->SetValue((kt_int32u)n);
 }
 
 void Mapper::setParamLoopClosureMoveScan(bool b)
