@@ -268,6 +268,24 @@ void SlamToolbox::setParams()
   enable_interactive_mode_ = this->declare_parameter("enable_interactive_mode",
       enable_interactive_mode_);
 
+  // Stationary correction (stationary_correction.hpp).
+  StationaryCorrectionParams stationary;
+  stationary.enabled = this->declare_parameter("stationary_correction", false);
+  stationary.interval = this->declare_parameter("stationary_correction_interval", 2.0);
+  stationary.max_speed = this->declare_parameter("stationary_max_speed", 0.002);
+  stationary.max_drift_rate = this->declare_parameter("stationary_max_drift_rate", 0.01);
+  stationary.heading_floor =
+    this->declare_parameter("stationary_correction_heading_floor", 0.0087);
+  stationary.heading_cap = this->declare_parameter("stationary_correction_heading_cap", 0.175);
+  stationary.max_translation =
+    this->declare_parameter("stationary_correction_max_translation", 0.08);
+  stationary.translation_per_meter =
+    this->declare_parameter("stationary_correction_translation_per_meter", 0.1);
+  stationary.agree_heading =
+    this->declare_parameter("stationary_correction_agree_heading", 0.0052);
+  stationary.min_response = this->declare_parameter("stationary_correction_min_response", 0.05);
+  stationary_ = std::make_unique<StationaryCorrection>(stationary);
+
   double tmp_val = 0.5;
   tmp_val = this->declare_parameter("transform_timeout", tmp_val);
   transform_timeout_ = rclcpp::Duration::from_seconds(tmp_val);
@@ -631,11 +649,24 @@ bool SlamToolbox::shouldProcessScan(
   const Pose2 & sensor_pose)
 /*****************************************************************************/
 {
+  return classifyScan(scan, sensor_pose, std::nullopt) == ScanAction::AddToGraph;
+}
+
+/*****************************************************************************/
+SlamToolbox::ScanAction SlamToolbox::classifyScan(
+  const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
+  const Pose2 & sensor_pose, const std::optional<Pose2> & odom_pose)
+/*****************************************************************************/
+{
   scan_ctr_++;
+  const bool stationary_correction = odom_pose && stationary_ && stationary_->params().enabled;
 
   // we are in a paused mode, reject incomming information
   if (isPaused(NEW_MEASUREMENTS)) {
-    return false;
+    if (stationary_correction) {
+      stationary_->interrupt();
+    }
+    return ScanAction::Skip;
   }
 
   // we give it a pass on the first measurement to get the ball rolling
@@ -643,30 +674,37 @@ bool SlamToolbox::shouldProcessScan(
     last_scan_time_ = scan->header.stamp;
     last_scan_pose_ = sensor_pose;
     first_measurement_ = false;
-    return true;
+    return ScanAction::AddToGraph;
   }
 
   // throttled out
   if ((scan_ctr_ % throttle_scans_) != 0) {
-    return false;
+    return ScanAction::Skip;
   }
 
   // give odometry/localization a few scans to stabilize after (re)start
   if (scan_ctr_ < 5) {
-    return false;
+    return ScanAction::Skip;
+  }
+
+  // Standing still: nothing is added (not even by the time rule), drift cannot count as having
+  // turned, and map->odom is corrected instead.
+  const double t = rclcpp::Time(scan->header.stamp).seconds();
+  if (stationary_correction && stationary_->isStationary(*odom_pose, t)) {
+    return stationary_->attemptDue(t) ? ScanAction::CorrectOnly : ScanAction::Skip;
   }
 
   // single source of truth: same time/heading/distance OR check karto uses internally
   const double time_interval =
     (rclcpp::Time(scan->header.stamp) - last_scan_time_).seconds();
   if (!smapper_->getMapper()->HasMovedEnough(sensor_pose, last_scan_pose_, time_interval)) {
-    return false;
+    return ScanAction::Skip;
   }
 
   last_scan_pose_ = sensor_pose;
   last_scan_time_ = scan->header.stamp;
 
-  return true;
+  return ScanAction::AddToGraph;
 }
 
 /*****************************************************************************/
@@ -732,6 +770,9 @@ LocalizedRangeScan * SlamToolbox::addScan(
     setTransformFromPoses(range_scan->GetCorrectedPose(), odom_pose,
       scan->header.stamp, update_reprocessing_transform);
     dataset_->Add(range_scan);
+    if (stationary_) {
+      stationary_->onGraphScan(odom_pose, rclcpp::Time(scan->header.stamp).seconds());
+    }
 
     publishPose(range_scan->GetCorrectedPose(), covariance, scan->header.stamp);
   } else {
@@ -740,6 +781,53 @@ LocalizedRangeScan * SlamToolbox::addScan(
   }
 
   return range_scan;
+}
+
+/*****************************************************************************/
+SlamToolbox::StationaryAttempt SlamToolbox::correctStationaryPose(
+  LaserRangeFinder * laser, const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
+  Pose2 & odom_pose)
+/*****************************************************************************/
+{
+  StationaryAttempt attempt;
+  std::unique_ptr<LocalizedRangeScan> range_scan(getLocalizedRangeScan(laser, scan, odom_pose));
+  boost::mutex::scoped_lock lock(smapper_mutex_);
+  karto::Mapper * mapper = smapper_->getMapper();
+  attempt.predicted = mapper->PredictCorrectedPose(range_scan.get());
+  Matrix3 covariance;
+  covariance.SetToIdentity();
+  attempt.response = mapper->MatchOnly(range_scan.get(), &covariance);
+  attempt.matched = range_scan->GetCorrectedPose();
+  attempt.verdict = stationary_->evaluate(attempt.predicted, attempt.matched, attempt.response,
+      odom_pose, rclcpp::Time(scan->header.stamp).seconds());
+  const double heading_deg = karto::math::NormalizeAngle(
+    attempt.matched.GetHeading() - attempt.predicted.GetHeading()) * 180.0 / M_PI;
+  if (!attempt.verdict.accepted) {
+    // A rejected match (implausible as drift) is worth seeing; waiting for agreement is not.
+    const auto reason = attempt.verdict.reason;
+    const bool rejected = reason == StationaryCorrection::Reason::LowResponse ||
+      reason == StationaryCorrection::Reason::Heading ||
+      reason == StationaryCorrection::Reason::Translation;
+    const char * format = "Stationary correction not applied (%s): heading %.2f deg "
+      "(limit %.2f), response %.3f";
+    if (rejected) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 60000, format,
+        StationaryCorrection::toString(reason), heading_deg,
+        attempt.verdict.heading_limit * 180.0 / M_PI, attempt.response);
+    } else {
+      RCLCPP_DEBUG(get_logger(), format, StationaryCorrection::toString(reason), heading_deg,
+        attempt.verdict.heading_limit * 180.0 / M_PI, attempt.response);
+    }
+    return attempt;
+  }
+  const Pose2 corrected = StationaryCorrection::applied(attempt.predicted, attempt.matched);
+  mapper->SetPredictionAnchor(range_scan->GetSensorName(), range_scan->GetOdometricPose(),
+    corrected);
+  setTransformFromPoses(corrected, odom_pose, scan->header.stamp, false);
+  publishPose(corrected, covariance, scan->header.stamp);
+  RCLCPP_DEBUG(get_logger(), "Stationary correction: heading %.2f deg, response %.3f",
+    heading_deg, attempt.response);
+  return attempt;
 }
 
 /*****************************************************************************/
@@ -945,6 +1033,9 @@ bool SlamToolbox::deserializePoseGraphCallback(
   updateMap();
 
   first_measurement_ = true;
+  if (stationary_) {
+    stationary_->reset();
+  }
   boost::mutex::scoped_lock l(pose_mutex_);
   switch (req->match_type) {
     case procType::START_AT_FIRST_NODE:

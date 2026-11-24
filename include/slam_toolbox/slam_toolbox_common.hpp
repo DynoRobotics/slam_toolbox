@@ -52,6 +52,7 @@
 #include "slam_toolbox/get_pose_helper.hpp"
 #include "slam_toolbox/map_saver.hpp"
 #include "slam_toolbox/loop_closure_assistant.hpp"
+#include "slam_toolbox/stationary_correction.hpp"
 
 namespace slam_toolbox
 {
@@ -121,6 +122,28 @@ protected:
   bool shouldProcessScan(
     const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
     const karto::Pose2 & sensor_pose);
+
+  // What to do with a scan: add it to the graph, only correct map->odom with it (stationary
+  // correction, StationaryCorrection), or nothing. odom_pose is the robot's odom pose; without
+  // it, or with stationary_correction off, this is shouldProcessScan: add or skip.
+  enum class ScanAction {Skip, AddToGraph, CorrectOnly};
+  ScanAction classifyScan(
+    const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
+    const karto::Pose2 & sensor_pose, const std::optional<karto::Pose2> & odom_pose);
+
+  // One stationary correction attempt (classifyScan returned CorrectOnly): matches the scan
+  // without adding it and, if the gate accepts it, updates map->odom and /pose and carries the
+  // correction over to the next scan added.
+  struct StationaryAttempt
+  {
+    StationaryCorrection::Verdict verdict;
+    karto::Pose2 predicted;  // robot pose in the map frame
+    karto::Pose2 matched;
+    double response{-1.0};
+  };
+  StationaryAttempt correctStationaryPose(
+    karto::LaserRangeFinder * laser, const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
+    karto::Pose2 & odom_pose);
   void publishPose(
     const Pose2 & pose,
     const Matrix3 & cov,
@@ -166,6 +189,8 @@ protected:
   double position_covariance_scale_;
   double yaw_covariance_scale_;
   bool first_measurement_, enable_interactive_mode_;
+
+  std::unique_ptr<StationaryCorrection> stationary_;
 
   // shouldProcessScan bookkeeping (last *sensor* pose/time passed to it)
   karto::Pose2 last_scan_pose_;

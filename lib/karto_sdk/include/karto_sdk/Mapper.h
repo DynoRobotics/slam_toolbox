@@ -2578,6 +2578,31 @@ public:
   kt_bool ProcessAgainstNode(LocalizedRangeScan * pScan, const int & nodeId, Matrix3 * covariance = nullptr);
   kt_bool ProcessAgainstNodesNearBy(LocalizedRangeScan * pScan, kt_bool addScanToLocalizationBuffer = false, Matrix3 * covariance = nullptr);
   kt_bool ProcessLocalization(LocalizedRangeScan * pScan, Matrix3 * covariance = nullptr);
+
+  /**
+   * The corrected pose a new scan of pScan's sensor is predicted at, from its odometric pose:
+   * from the prediction anchor while it is valid (SetPredictionAnchor), otherwise from the last
+   * scan's odometric-to-corrected transform. pScan's own corrected pose without a last scan.
+   */
+  Pose2 PredictCorrectedPose(const LocalizedRangeScan * pScan);
+
+  /**
+   * Matches pScan against the running scans as Process does, from PredictCorrectedPose, but adds
+   * it to nothing: not the graph, the scan buffer, the running scans or the last scan. Sets its
+   * corrected pose to the match. Returns the match response, or a negative value when there is
+   * nothing to match (invalid scan, no scan processed yet, or scan matching off).
+   * For slam_toolbox's stationary correction: keeps map->odom up to date while standing still.
+   */
+  kt_double MatchOnly(LocalizedRangeScan * pScan, Matrix3 * covariance = nullptr);
+
+  /**
+   * Makes new scans of this sensor predict from the pair (odometric, corrected) instead of the
+   * last scan, so a correction from MatchOnly carries over to the next scan added. Valid while
+   * the last scan is the one it was set on, with the same corrected pose: a new scan, a graph
+   * optimization that moves it, or a reset drops it. Not serialized.
+   */
+  void SetPredictionAnchor(
+    const Name & rSensorName, const Pose2 & rOdometric, const Pose2 & rCorrected);
   kt_bool RemoveNodeFromGraph(Vertex<LocalizedRangeScan> *);
   void AddScanToLocalizationBuffer(LocalizedRangeScan * pScan, Vertex<LocalizedRangeScan> * scan_vertex);
   void ClearLocalizationBuffer();
@@ -2758,6 +2783,16 @@ protected:
   MapperGraph * m_pGraph;
   ScanSolver * m_pScanOptimizer;
   LocalizationScanVertices m_LocalizationScanVertices;
+
+  // SetPredictionAnchor, per sensor name.
+  struct PredictionAnchor
+  {
+    kt_int32s lastScanId;
+    Pose2 lastScanCorrected;  // the last scan's corrected pose when set
+    Pose2 odometric;
+    Pose2 corrected;
+  };
+  std::map<std::string, PredictionAnchor> m_PredictionAnchors;
 
 
   std::vector<MapperListener *> m_Listeners;

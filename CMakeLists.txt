@@ -141,7 +141,7 @@ target_link_libraries(ceres_solver_plugin "${cpp_typesupport_target}")
 pluginlib_export_plugin_description_file(slam_toolbox solver_plugins.xml)
 
 #### Tool lib for mapping
-add_library(toolbox_common src/slam_toolbox_common.cpp src/map_saver.cpp src/loop_closure_assistant.cpp src/laser_utils.cpp src/slam_mapper.cpp)
+add_library(toolbox_common src/slam_toolbox_common.cpp src/map_saver.cpp src/loop_closure_assistant.cpp src/laser_utils.cpp src/slam_mapper.cpp src/stationary_correction.cpp)
 ament_target_dependencies(toolbox_common
   ${dependencies}
 )
@@ -198,6 +198,10 @@ if(BUILD_TESTING)
 
   ament_add_gtest(reflector_scan_test test/reflector_scan_test.cpp)
   target_link_libraries(reflector_scan_test kartoSlamToolbox)
+
+  ament_add_gtest(stationary_correction_test test/stationary_correction_test.cpp
+    src/stationary_correction.cpp)
+  target_link_libraries(stationary_correction_test kartoSlamToolbox)
 
   ament_add_gtest(ceres_extrinsic_test test/ceres_extrinsic_test.cpp)
   ament_target_dependencies(ceres_extrinsic_test ${dependencies})

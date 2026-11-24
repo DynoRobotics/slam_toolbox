@@ -20,7 +20,9 @@
 // closures and gated near chains) as a grid of the best response per position
 // (ScanMatcher::SetPositionSurfaceDump). Every gated match attempt goes to
 // <out_prefix>_gated.csv: search centre, coarse mean and covariance before any ridge
-// inflation, fine mean, outcome, and the chain scan it links to.
+// inflation, fine mean, outcome, and the chain scan it links to. With stationary_correction,
+// every correction attempt goes to <out_prefix>_corrections.csv: predicted and matched robot
+// pose, response, the gate's verdict and heading limit.
 //
 // For watching in RViz: the node publishes /map, /slam_toolbox/graph_visualization and /pose as
 // the live one does, the map and graph every map_update_interval of wall time (the map only
@@ -202,6 +204,22 @@ public:
       (std::abs(a - b) <= 1 ? sequential : cross)++;
     }
     writeEdges(out_prefix + "_edges.csv");
+    std::size_t corrections_accepted = 0;
+    if (!corrections_.empty()) {
+      FILE * f = std::fopen((out_prefix + "_corrections.csv").c_str(), "w");
+      std::fprintf(f, "stamp_ns,accepted,reason,pred_x,pred_y,pred_yaw,match_x,match_y,match_yaw,"
+        "response,heading_limit\n");
+      for (const auto & [stamp, a] : corrections_) {
+        corrections_accepted += a.verdict.accepted ? 1 : 0;
+        std::fprintf(f, "%ld,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", stamp,
+          a.verdict.accepted ? 1 : 0, StationaryCorrection::toString(a.verdict.reason),
+          a.predicted.GetX(), a.predicted.GetY(), a.predicted.GetHeading(), a.matched.GetX(),
+          a.matched.GetY(), a.matched.GetHeading(), a.response, a.verdict.heading_limit);
+      }
+      std::fclose(f);
+      RCLCPP_INFO(get_logger(), "offline_replay: stationary corrections: %zu attempts, %zu accepted",
+        corrections_.size(), corrections_accepted);
+    }
     writeGated(out_prefix + "_gated.csv");
     const auto & loops = smapper_->getMapper()->GetGraph()->GetLoopClosureStats();
     RCLCPP_INFO(get_logger(),
@@ -263,7 +281,13 @@ protected:
       return;
     }
     const karto::Pose2 sensor_pose = karto::Transform(pose).TransformPose(laser->GetOffsetPose());
-    if (!shouldProcessScan(scan, sensor_pose)) {
+    const ScanAction action = classifyScan(scan, sensor_pose, pose);
+    if (action == ScanAction::CorrectOnly) {
+      corrections_.push_back(
+        {rclcpp::Time(scan->header.stamp).nanoseconds(), correctStationaryPose(laser, scan, pose)});
+      return;
+    }
+    if (action != ScanAction::AddToGraph) {
       return;
     }
     if (surface_ && smapper_->getMapper()->GetSequentialScanMatcher()) {
@@ -447,6 +471,8 @@ private:
   }
 
   std::map<int, Online> online_;
+  // Stationary correction attempts (stationary_correction), with their scan stamps.
+  std::vector<std::pair<int64_t, StationaryAttempt>> corrections_;
 
 public:
   std::unique_ptr<std::ofstream> surface_;

@@ -4553,6 +4553,7 @@ void Mapper::Reset()
   }
   m_Initialized = false;
   m_Deserialized = false;
+  m_PredictionAnchors.clear();
   while (!m_LocalizationScanVertices.empty()) {
     m_LocalizationScanVertices.pop();
   }
@@ -4583,8 +4584,7 @@ kt_bool Mapper::Process(LocalizedRangeScan * pScan, Matrix3 * covariance)
 
     // update scans corrected pose based on last correction
     if (pLastScan != NULL) {
-      Transform lastTransform(pLastScan->GetOdometricPose(), pLastScan->GetCorrectedPose());
-      pScan->SetCorrectedPose(lastTransform.TransformPose(pScan->GetOdometricPose()));
+      pScan->SetCorrectedPose(PredictCorrectedPose(pScan));
     }
 
     // test if scan is outside minimum boundary or if heading is larger then minimum heading
@@ -4628,11 +4628,68 @@ kt_bool Mapper::Process(LocalizedRangeScan * pScan, Matrix3 * covariance)
     }
 
     m_pMapperSensorManager->SetLastScan(pScan);
+    m_PredictionAnchors.erase(pScan->GetSensorName().ToString());
 
     return true;
   }
 
   return false;
+}
+
+Pose2 Mapper::PredictCorrectedPose(const LocalizedRangeScan * pScan)
+{
+  LocalizedRangeScan * pLastScan = m_pMapperSensorManager ?
+    m_pMapperSensorManager->GetLastScan(pScan->GetSensorName()) : NULL;
+  if (pLastScan == NULL) {
+    return pScan->GetCorrectedPose();
+  }
+  const auto anchor = m_PredictionAnchors.find(pScan->GetSensorName().ToString());
+  if (anchor != m_PredictionAnchors.end() &&
+    anchor->second.lastScanId == pLastScan->GetUniqueId() &&
+    anchor->second.lastScanCorrected == pLastScan->GetCorrectedPose())
+  {
+    return Transform(anchor->second.odometric, anchor->second.corrected).TransformPose(
+      pScan->GetOdometricPose());
+  }
+  Transform lastTransform(pLastScan->GetOdometricPose(), pLastScan->GetCorrectedPose());
+  return lastTransform.TransformPose(pScan->GetOdometricPose());
+}
+
+kt_double Mapper::MatchOnly(LocalizedRangeScan * pScan, Matrix3 * covariance)
+{
+  if (pScan == NULL || !m_Initialized || !m_pUseScanMatching->GetValue()) {
+    return -1.0;
+  }
+  LaserRangeFinder * pLaserRangeFinder = pScan->GetLaserRangeFinder();
+  if (pLaserRangeFinder == NULL || pLaserRangeFinder->Validate(pScan) == false) {
+    return -1.0;
+  }
+  if (m_pMapperSensorManager->GetLastScan(pScan->GetSensorName()) == NULL) {
+    return -1.0;
+  }
+  pScan->SetCorrectedPose(PredictCorrectedPose(pScan));
+  Pose2 bestPose;
+  Matrix3 cov;
+  cov.SetToIdentity();
+  const kt_double response = m_pSequentialScanMatcher->MatchScan(pScan,
+      m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()), bestPose, cov);
+  pScan->SetSensorPose(bestPose);
+  if (covariance) {
+    *covariance = cov;
+  }
+  return response;
+}
+
+void Mapper::SetPredictionAnchor(
+  const Name & rSensorName, const Pose2 & rOdometric, const Pose2 & rCorrected)
+{
+  LocalizedRangeScan * pLastScan = m_pMapperSensorManager ?
+    m_pMapperSensorManager->GetLastScan(rSensorName) : NULL;
+  if (pLastScan == NULL) {
+    return;
+  }
+  m_PredictionAnchors[rSensorName.ToString()] =
+    {pLastScan->GetUniqueId(), pLastScan->GetCorrectedPose(), rOdometric, rCorrected};
 }
 
 kt_bool Mapper::ProcessAgainstNodesNearBy(LocalizedRangeScan * pScan, kt_bool addScanToLocalizationBuffer, Matrix3 * covariance)
