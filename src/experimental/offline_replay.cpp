@@ -4,9 +4,11 @@
 //
 // Usage:
 //   offline_replay <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>]
-//     --ros-args --params-file <slam params> [-p ...]
+//     [--viz] [--rate <factor>] [--start <seconds>] --ros-args --params-file <slam params> [-p ...]
 //
-// The bag needs the scan topic (scan_topic, e.g. /scan_filtered) and /tf, /tf_static. Messages
+// The bag needs the scan topic (scan_topic, e.g. /scan_filtered) and /tf, /tf_static.
+// /slam_toolbox/pause, when present (scan_offline writes scan_node's), pauses new
+// measurements in bag order, as the live node's subscription does. Messages
 // are read in bag order; /tf goes straight into the transform buffer, and each scan waits until
 // odom has been read past its stamp, then goes through the same steps as the synchronous node
 // (odom pose, shouldProcessScan, addScan), one at a time. Writes <out_prefix>_poses.csv with the
@@ -19,6 +21,18 @@
 // (ScanMatcher::SetPositionSurfaceDump). Every gated match attempt goes to
 // <out_prefix>_gated.csv: search centre, coarse mean and covariance before any ridge
 // inflation, fine mean, outcome, and the chain scan it links to.
+//
+// For watching in RViz: the node publishes /map, /slam_toolbox/graph_visualization and /pose as
+// the live one does, the map and graph every map_update_interval of wall time (the map only
+// while someone subscribes). --rate <factor> paces the replay to at most factor times real
+// time (scan stamps), so the map can be seen growing; without it the replay runs as fast as it
+// can. --viz keeps the node up after the last scan, publishing the final map and graph, until
+// Ctrl-C. Ctrl-C during the replay stops reading and writes the outputs for the scans so far.
+// Neither changes the results.
+//
+// --start <seconds> skips the scans in the first <seconds> after the bag's first scan (by scan
+// stamp); slam starts on the first scan after that, with the transforms before it already in
+// the buffer.
 
 #include <sys/resource.h>
 
@@ -32,7 +46,11 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
@@ -42,6 +60,7 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "slam_toolbox/serialization.hpp"
 #include "slam_toolbox/slam_toolbox_common.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 
 namespace slam_toolbox
@@ -53,7 +72,9 @@ public:
   explicit OfflineReplay(rclcpp::NodeOptions options)
   : SlamToolbox(options) {}
 
-  int run(const std::string & bag, const std::string & out_prefix, bool save)
+  int run(
+    const std::string & bag, const std::string & out_prefix, bool save, double rate,
+    double start_offset)
   {
     const auto start = std::chrono::steady_clock::now();
     rosbag2_storage::StorageOptions storage;
@@ -64,10 +85,22 @@ public:
 
     rclcpp::Serialization<tf2_msgs::msg::TFMessage> tf_serialization;
     rclcpp::Serialization<sensor_msgs::msg::LaserScan> scan_serialization;
-    std::deque<sensor_msgs::msg::LaserScan::ConstSharedPtr> pending;
+    // Scans waiting for odom, and pause changes kept in order with them: a pause takes effect
+    // once every scan read before it has gone.
+    std::deque<std::variant<sensor_msgs::msg::LaserScan::ConstSharedPtr, bool>> pending;
+    rclcpp::Serialization<std_msgs::msg::Bool> pause_serialization;
     rclcpp::Time odom_until(0, 0, RCL_ROS_TIME);
+    // --rate: the first scan's stamp and the wall time it was read.
+    std::optional<std::pair<rclcpp::Time, std::chrono::steady_clock::time_point>> pace_start;
+    // --start: scans stamped before this are skipped (set from the first scan).
+    std::optional<rclcpp::Time> start_at;
+    std::size_t skipped = 0;
 
     while (reader.has_next()) {
+      if (!rclcpp::ok()) {
+        RCLCPP_WARN(get_logger(), "offline_replay: interrupted, writing what was replayed");
+        break;
+      }
       const auto bag_msg = reader.read_next();
       const rclcpp::SerializedMessage serialized(*bag_msg->serialized_data);
       if (bag_msg->topic_name == "/tf" || bag_msg->topic_name == "/tf_static") {
@@ -86,20 +119,64 @@ public:
         auto scan = std::make_shared<sensor_msgs::msg::LaserScan>();
         scan_serialization.deserialize_message(&serialized, scan.get());
         ++scans_read_;
+        if (!start_at) {
+          start_at = rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) +
+            rclcpp::Duration::from_seconds(start_offset);
+        }
+        if (rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) < *start_at) {
+          ++skipped;
+          continue;
+        }
+        // Paced by scan stamps, not the bag's receive times, which can jump.
+        if (rate > 0.0) {
+          const rclcpp::Time stamp(scan->header.stamp, RCL_ROS_TIME);
+          if (!pace_start) {
+            pace_start.emplace(stamp, std::chrono::steady_clock::now());
+          }
+          const double ahead = (stamp - pace_start->first).seconds() / rate;
+          if (ahead > 0.0) {
+            std::this_thread::sleep_until(
+              pace_start->second + std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(ahead)));
+          }
+        }
         pending.push_back(scan);
+      } else if (bag_msg->topic_name == "slam_toolbox/pause" ||
+        bag_msg->topic_name == "/slam_toolbox/pause")
+      {
+        std_msgs::msg::Bool pause;
+        pause_serialization.deserialize_message(&serialized, &pause);
+        pending.push_back(pause.data);
       } else {
         continue;
       }
       // Odom is interpolated, so a scan can go once odom has been read past its stamp.
-      while (!pending.empty() &&
-        rclcpp::Time(pending.front()->header.stamp, RCL_ROS_TIME) <= odom_until)
-      {
-        timedCallback(pending.front());
+      while (!pending.empty()) {
+        if (const bool * pause = std::get_if<bool>(&pending.front())) {
+          setPaused(*pause);
+        } else {
+          const auto & scan = std::get<sensor_msgs::msg::LaserScan::ConstSharedPtr>(pending.front());
+          if (rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) > odom_until) {
+            break;
+          }
+          timedCallback(scan);
+        }
         pending.pop_front();
       }
     }
-    for (const auto & scan : pending) {
-      timedCallback(scan);
+    if (skipped > 0) {
+      RCLCPP_INFO(get_logger(), "offline_replay: --start: skipped the first %zu scans (%.1f s)",
+        skipped, start_offset);
+    }
+    for (const auto & item : pending) {
+      if (!rclcpp::ok()) {
+        break;
+      }
+      if (const bool * pause = std::get_if<bool>(&item)) {
+        setPaused(*pause);
+      } else {
+        timedCallback(std::get<sensor_msgs::msg::LaserScan::ConstSharedPtr>(item));
+      }
     }
 
     {
@@ -128,10 +205,10 @@ public:
     writeGated(out_prefix + "_gated.csv");
     const auto & loops = smapper_->getMapper()->GetGraph()->GetLoopClosureStats();
     RCLCPP_INFO(get_logger(),
-      "offline_replay: %zu scans read, %zu processed, %zu without odom, %.1f s, "
+      "offline_replay: %zu scans read, %zu processed, %zu without odom, %zu paused, %.1f s, "
       "edges %zu sequential + %zu cross; loop closures: %u attempts, %u accepted (%u ridge, %u peak), "
       "rejected %u coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
-      scans_read_, online_.size(), no_odom_, seconds, sequential, cross, loops.attempts,
+      scans_read_, online_.size(), no_odom_, paused_scans_, seconds, sequential, cross, loops.attempts,
       loops.accepted, loops.acceptedRidge, loops.acceptedPeak, loops.rejectedCoarseResponse, loops.rejectedVariance,
       loops.rejectedFineResponse, loops.rejectedGate, loops.reflectorsActive);
     logExtrinsics();
@@ -149,6 +226,21 @@ public:
         near.throttled, near.capped);
     }
     return 0;
+  }
+
+  // After the replay (--viz): the final map and graph now, then the visualization thread
+  // republishes them every map_update_interval until Ctrl-C.
+  void holdVisualization()
+  {
+    updateMap();
+    {
+      boost::mutex::scoped_lock lock(smapper_mutex_);
+      closure_assistant_->publishGraph();
+    }
+    RCLCPP_INFO(get_logger(), "offline_replay: --viz: showing the final map and graph, Ctrl-C to exit");
+    while (rclcpp::ok()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
   }
 
 protected:
@@ -371,8 +463,17 @@ private:
   };
   std::vector<CallbackTiming> callback_seconds_;
 
+  // /slam_toolbox/pause from the bag (scan_node's), as the live node's subscription applies it.
+  void setPaused(bool paused)
+  {
+    state_.set(NEW_MEASUREMENTS, paused);
+  }
+
   void timedCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan)
   {
+    if (isPaused(NEW_MEASUREMENTS)) {
+      ++paused_scans_;
+    }
     const std::size_t before = online_.size();
     const auto * graph = smapper_->getMapper()->GetGraph();
     const auto p0 = graph ? graph->GetPhaseSeconds() : karto::MapperGraph::PhaseSeconds{};
@@ -387,6 +488,7 @@ private:
     }
   }
   std::size_t no_odom_{0};
+  std::size_t paused_scans_{0};  // scans that arrived while /slam_toolbox/pause was set
 };
 
 }  // namespace slam_toolbox
@@ -397,10 +499,13 @@ int main(int argc, char ** argv)
   if (args.size() < 3) {
     std::fprintf(stderr,
       "Usage: %s <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>] "
-      "--ros-args ...\n", argv[0]);
+      "[--viz] [--rate <factor>] [--start <seconds>] --ros-args ...\n", argv[0]);
     return 1;
   }
   bool save = false;
+  bool viz = false;
+  double rate = 0.0;
+  double start_offset = 0.0;
   std::string surface;
   std::string loop_surface;
   for (std::size_t i = 3; i < args.size(); i++) {
@@ -410,6 +515,15 @@ int main(int argc, char ** argv)
       surface = args[++i];
     } else if (args[i] == "--loop-surface" && i + 1 < args.size()) {
       loop_surface = args[++i];
+    } else if (args[i] == "--viz") {
+      viz = true;
+    } else if (args[i] == "--rate" && i + 1 < args.size()) {
+      rate = std::stod(args[++i]);
+    } else if (args[i] == "--start" && i + 1 < args.size()) {
+      start_offset = std::stod(args[++i]);
+    } else {
+      std::fprintf(stderr, "offline_replay: unknown argument %s\n", args[i].c_str());
+      return 1;
     }
   }
 
@@ -432,13 +546,17 @@ int main(int argc, char ** argv)
     node->loop_surface_ = std::make_unique<std::ofstream>(loop_surface);
     *node->loop_surface_ << std::setprecision(6);
   }
-  const int result = node->run(args[1], args[2], save);
+  const int result = node->run(args[1], args[2], save, rate, start_offset);
   // std::_Exit below skips the streams' destructors; flush them here.
   if (node->surface_) {
     node->surface_->flush();
   }
   if (node->loop_surface_) {
     node->loop_surface_->flush();
+  }
+  if (viz && rclcpp::ok()) {
+    std::fflush(nullptr);
+    node->holdVisualization();
   }
   rclcpp::shutdown();
   // Everything is written and closed. Tearing the node down can race the base class's worker
