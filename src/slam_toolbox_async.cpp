@@ -58,7 +58,9 @@ void AsynchronousSlamToolbox::laserCallback(
   // if not paused, process scan
   switch (classifyScan(scan, sensor_pose, pose)) {
     case ScanAction::AddToGraph:
-      addScan(laser, scan, pose);
+      if (!addScan(laser, scan, pose)) {
+        undoScanAcceptance();
+      }
       break;
     case ScanAction::CorrectOnly:
       correctStationaryPose(laser, scan, pose);

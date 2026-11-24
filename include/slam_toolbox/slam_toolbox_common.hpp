@@ -130,6 +130,10 @@ protected:
   ScanAction classifyScan(
     const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
     const karto::Pose2 & sensor_pose, const std::optional<karto::Pose2> & odom_pose);
+  // A scan classifyScan passed for the graph was not added (addScan returned null, e.g. the
+  // sequential heading gate): forget it was accepted, so the next scan tries again rather than
+  // waiting for the robot to move on from it.
+  void undoScanAcceptance();
 
   // One stationary correction attempt (classifyScan returned CorrectOnly): matches the scan
   // without adding it and, if the gate accepts it, updates map->odom and /pose and carries the
@@ -195,6 +199,9 @@ protected:
   // shouldProcessScan bookkeeping (last *sensor* pose/time passed to it)
   karto::Pose2 last_scan_pose_;
   rclcpp::Time last_scan_time_;
+  // Their values before the last accepted scan (undoScanAcceptance).
+  karto::Pose2 previous_scan_pose_;
+  rclcpp::Time previous_scan_time_;
   int scan_ctr_;
 
   // Book keeping

@@ -223,10 +223,12 @@ public:
     writeGated(out_prefix + "_gated.csv");
     const auto & loops = smapper_->getMapper()->GetGraph()->GetLoopClosureStats();
     RCLCPP_INFO(get_logger(),
-      "offline_replay: %zu scans read, %zu processed, %zu without odom, %zu paused, %.1f s, "
+      "offline_replay: %zu scans read, %zu processed, %zu without odom, %zu paused, "
+      "%u heading-gated, %.1f s, "
       "edges %zu sequential + %zu cross; loop closures: %u attempts, %u accepted (%u ridge, %u peak), "
       "rejected %u coarse response, %u variance, %u fine response, %u gate; reflectors in %u",
-      scans_read_, online_.size(), no_odom_, paused_scans_, seconds, sequential, cross, loops.attempts,
+      scans_read_, online_.size(), no_odom_, paused_scans_,
+      smapper_->getMapper()->GetSequentialHeadingRejections(), seconds, sequential, cross, loops.attempts,
       loops.accepted, loops.acceptedRidge, loops.acceptedPeak, loops.rejectedCoarseResponse, loops.rejectedVariance,
       loops.rejectedFineResponse, loops.rejectedGate, loops.reflectorsActive);
     logExtrinsics();
@@ -299,6 +301,9 @@ protected:
       smapper_->getMapper()->GetLoopScanMatcher()->SetPositionSurfaceDump(loop_surface_.get());
     }
     karto::LocalizedRangeScan * range_scan = addScan(laser, scan, pose);
+    if (!range_scan) {
+      undoScanAcceptance();
+    }
     if (range_scan) {
       const karto::ScanMatcher * matcher = smapper_->getMapper()->GetSequentialScanMatcher();
       online_[range_scan->GetUniqueId()] =

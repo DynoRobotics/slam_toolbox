@@ -547,6 +547,20 @@ void SMapper::configure(const rclcpp::Node::SharedPtr & node)
   node->get_parameter("odometry_prior_gate_chi2", odometry_prior_gate_chi2);
   mapper_->setParamOdometryPriorGateChi2(odometry_prior_gate_chi2);
 
+  // Sequential heading gate (karto::Mapper::setParamSequentialHeadingGate).
+  const auto declared = [&node](const std::string & name, auto value) {
+      if (!node->has_parameter(name)) {
+        node->declare_parameter(name, value);
+      }
+      node->get_parameter(name, value);
+      return value;
+    };
+  mapper_->setParamSequentialHeadingGate(
+    declared("sequential_heading_gate", false),
+    declared("sequential_heading_gate_floor", 0.044),
+    declared("sequential_heading_gate_per_radian", 0.05),
+    declared("sequential_heading_gate_drift_rate", 0.01));
+
   double odometry_prior_stddev_cross_per_m = 0.05;
   if (!node->has_parameter("odometry_prior_stddev_cross_per_m")) {
     node->declare_parameter("odometry_prior_stddev_cross_per_m",

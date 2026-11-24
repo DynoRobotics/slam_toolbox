@@ -4401,6 +4401,12 @@ void Mapper::setParamOdometryPriorGateChi2(double v)
   m_pOdometryPriorGateChi2->SetValue((kt_double)v);
 }
 
+void Mapper::setParamSequentialHeadingGate(
+  bool enabled, double floor, double perRadian, double driftRate)
+{
+  m_SequentialHeadingGate = {enabled, floor, perRadian, driftRate};
+}
+
 void Mapper::setParamOdometryPriorStddevCrossPerMeter(double v)
 {
   m_pOdometryPriorStddevCrossPerMeter->SetValue(v);
@@ -4602,6 +4608,19 @@ kt_bool Mapper::Process(LocalizedRangeScan * pScan, Matrix3 * covariance)
         m_pMapperSensorManager->GetRunningScans(pScan->GetSensorName()),
         bestPose,
         cov);
+      if (m_SequentialHeadingGate.enabled) {
+        const kt_double correction = fabs(math::NormalizeAngle(
+          bestPose.GetHeading() - pScan->GetSensorPose().GetHeading()));
+        const kt_double turn = fabs(math::NormalizeAngle(
+          pScan->GetOdometricPose().GetHeading() - pLastScan->GetOdometricPose().GetHeading()));
+        const kt_double elapsed = math::Maximum(pScan->GetTime() - pLastScan->GetTime(), 0.0);
+        const kt_double limit = m_SequentialHeadingGate.floor +
+          m_SequentialHeadingGate.perRadian * turn + m_SequentialHeadingGate.driftRate * elapsed;
+        if (correction > limit) {
+          ++m_SequentialHeadingRejections;
+          return false;
+        }
+      }
       pScan->SetSensorPose(bestPose);
       if (covariance) {
         *covariance = cov;

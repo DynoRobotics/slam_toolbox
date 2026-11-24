@@ -2794,6 +2794,17 @@ protected:
   };
   std::map<std::string, PredictionAnchor> m_PredictionAnchors;
 
+  // setParamSequentialHeadingGate
+  struct SequentialHeadingGate
+  {
+    kt_bool enabled{false};
+    kt_double floor{0.0};      // rad
+    kt_double perRadian{0.0};
+    kt_double driftRate{0.0};  // rad/s
+  };
+  SequentialHeadingGate m_SequentialHeadingGate;
+  kt_int32u m_SequentialHeadingRejections{0};
+
 
   std::vector<MapperListener *> m_Listeners;
 
@@ -3261,6 +3272,14 @@ public:
   void setParamOdometryPriorStddevYawPerMeter(double v);
   void setParamOdometryPriorStddevYawMin(double v);
   void setParamOdometryPriorGateChi2(double v);
+  // Sequential heading gate: Process does not add a scan whose match turns the heading from the
+  // odometric prediction by more than odometry can be off by since the last scan: floor, plus
+  // perRadian of the odometric turn, plus driftRate (rad/s) times the time since. Such a match
+  // is a weak scan matched wrongly (an open view during a spin); the next scan tries again, and
+  // the limit grows with time, so a real large error is still taken. Not serialized.
+  void setParamSequentialHeadingGate(
+    bool enabled, double floor, double perRadian, double driftRate);
+  kt_int32u GetSequentialHeadingRejections() const {return m_SequentialHeadingRejections;}
   void setParamOdometryPriorFuseHeading(bool v);
   void setParamOdometryPriorStddevCrossPerMeter(double v);
   void setParamLoopClosureGateChi2(double d);

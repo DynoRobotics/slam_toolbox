@@ -701,6 +701,8 @@ SlamToolbox::ScanAction SlamToolbox::classifyScan(
     return ScanAction::Skip;
   }
 
+  previous_scan_pose_ = last_scan_pose_;
+  previous_scan_time_ = last_scan_time_;
   last_scan_pose_ = sensor_pose;
   last_scan_time_ = scan->header.stamp;
 
@@ -781,6 +783,14 @@ LocalizedRangeScan * SlamToolbox::addScan(
   }
 
   return range_scan;
+}
+
+/*****************************************************************************/
+void SlamToolbox::undoScanAcceptance()
+/*****************************************************************************/
+{
+  last_scan_pose_ = previous_scan_pose_;
+  last_scan_time_ = previous_scan_time_;
 }
 
 /*****************************************************************************/
