@@ -283,6 +283,8 @@ void SlamToolbox::setParams()
     this->declare_parameter("stationary_correction_translation_per_meter", 0.1);
   stationary.agree_heading =
     this->declare_parameter("stationary_correction_agree_heading", 0.0052);
+  stationary.agree_translation =
+    this->declare_parameter("stationary_correction_agree_translation", 0.0);
   stationary.min_response = this->declare_parameter("stationary_correction_min_response", 0.05);
   stationary_ = std::make_unique<StationaryCorrection>(stationary);
 
@@ -830,13 +832,14 @@ SlamToolbox::StationaryAttempt SlamToolbox::correctStationaryPose(
     }
     return attempt;
   }
-  const Pose2 corrected = StationaryCorrection::applied(attempt.predicted, attempt.matched);
+  const Pose2 corrected =
+    StationaryCorrection::applied(attempt.predicted, attempt.matched, attempt.verdict);
   mapper->SetPredictionAnchor(range_scan->GetSensorName(), range_scan->GetOdometricPose(),
     corrected);
   setTransformFromPoses(corrected, odom_pose, scan->header.stamp, false);
   publishPose(corrected, covariance, scan->header.stamp);
-  RCLCPP_DEBUG(get_logger(), "Stationary correction: heading %.2f deg, response %.3f",
-    heading_deg, attempt.response);
+  RCLCPP_DEBUG(get_logger(), "Stationary correction: heading %.2f deg, position %s, response %.3f",
+    heading_deg, attempt.verdict.position ? "corrected" : "kept", attempt.response);
   return attempt;
 }
 

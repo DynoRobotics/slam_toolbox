@@ -208,13 +208,14 @@ public:
     if (!corrections_.empty()) {
       FILE * f = std::fopen((out_prefix + "_corrections.csv").c_str(), "w");
       std::fprintf(f, "stamp_ns,accepted,reason,pred_x,pred_y,pred_yaw,match_x,match_y,match_yaw,"
-        "response,heading_limit\n");
+        "response,heading_limit,position\n");
       for (const auto & [stamp, a] : corrections_) {
         corrections_accepted += a.verdict.accepted ? 1 : 0;
-        std::fprintf(f, "%ld,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", stamp,
+        std::fprintf(f, "%ld,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n", stamp,
           a.verdict.accepted ? 1 : 0, StationaryCorrection::toString(a.verdict.reason),
           a.predicted.GetX(), a.predicted.GetY(), a.predicted.GetHeading(), a.matched.GetX(),
-          a.matched.GetY(), a.matched.GetHeading(), a.response, a.verdict.heading_limit);
+          a.matched.GetY(), a.matched.GetHeading(), a.response, a.verdict.heading_limit,
+          a.verdict.position ? 1 : 0);
       }
       std::fclose(f);
       RCLCPP_INFO(get_logger(), "offline_replay: stationary corrections: %zu attempts, %zu accepted",

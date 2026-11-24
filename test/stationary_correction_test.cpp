@@ -176,16 +176,47 @@ TEST(StationaryCorrection, MillimetresOfEkfJitterStayStationary)
   }
 }
 
-TEST(StationaryCorrection, AgreementIsOnHeadingOnly)
+TEST(StationaryCorrection, AgreementIsOnHeadingOnlyWithoutAgreeTranslation)
 {
   StationaryCorrection c(params());
   c.onGraphScan(at(0), 0.0);
-  c.evaluate(at(0), at(1, 0.0), 0.5, at(0), 10.0);
+  c.evaluate(at(0), at(1, 0.05), 0.5, at(0), 10.0);
   // Along a corridor the position may jump between cells; the heading still agrees.
-  EXPECT_TRUE(c.evaluate(at(0), at(1, 0.05), 0.5, at(0), 20.0).accepted);
-  const Pose2 applied = StationaryCorrection::applied(at(0, 0.01), at(1, 0.05));
+  const auto verdict = c.evaluate(at(0), at(1, 0.05), 0.5, at(0), 20.0);
+  ASSERT_TRUE(verdict.accepted);
+  EXPECT_FALSE(verdict.position);
+  const Pose2 applied = StationaryCorrection::applied(at(0, 0.01), at(1, 0.05), verdict);
   EXPECT_DOUBLE_EQ(applied.GetX(), 0.01);
   EXPECT_DOUBLE_EQ(applied.GetHeading(), 1 * kDeg);
+}
+
+TEST(StationaryCorrection, PositionIsCorrectedWhenItAgreesToo)
+{
+  auto p = params();
+  p.agree_translation = 0.03;
+  StationaryCorrection c(p);
+  c.onGraphScan(at(0), 0.0);
+  c.evaluate(at(0), at(1, 0.05), 0.5, at(0), 10.0);
+  const auto agree = c.evaluate(at(0), at(1, 0.06), 0.5, at(0), 20.0);
+  ASSERT_TRUE(agree.accepted);
+  EXPECT_TRUE(agree.position);
+  const Pose2 applied = StationaryCorrection::applied(at(0, 0.01), at(1, 0.06), agree);
+  EXPECT_DOUBLE_EQ(applied.GetX(), 0.06);
+  // A position jumping between attempts (a corridor): the heading only.
+  const auto jump = c.evaluate(at(1, 0.06), at(1, 0.0), 0.5, at(0), 30.0);
+  ASSERT_TRUE(jump.accepted);
+  EXPECT_FALSE(jump.position);
+}
+
+TEST(StationaryCorrection, HeadingOnlyAcceptanceKeepsTheTranslationAllowance)
+{
+  StationaryCorrection c(params());
+  c.onGraphScan(at(0), 0.0);
+  // Stopped 0.3 m on: 0.11 m allowed, and still so after a heading-only correction there, as
+  // the position error of the drive is still in the prediction.
+  c.evaluate(at(0), at(1, 0.1), 0.5, at(0, 0.3), 10.0);
+  ASSERT_TRUE(c.evaluate(at(0), at(1, 0.1), 0.5, at(0, 0.3), 20.0).accepted);
+  EXPECT_TRUE(c.evaluate(at(1), at(1, 0.1), 0.5, at(0, 0.3), 30.0).accepted);
 }
 
 TEST(StationaryCorrection, TimeGoingBackResets)

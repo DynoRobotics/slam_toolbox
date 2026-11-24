@@ -38,7 +38,7 @@ void StationaryCorrection::onGraphScan(const karto::Pose2 & odom_base, double t)
   rate_prev_t_.reset();
   last_attempt_t_ = t;
   last_accepted_t_ = t;
-  last_accepted_odom_ = odom_base;
+  last_position_odom_ = odom_base;
   candidate_.reset();
 }
 
@@ -78,7 +78,7 @@ StationaryCorrection::Verdict StationaryCorrection::evaluate(
     params_.heading_cap,
     params_.heading_floor + params_.max_drift_rate * std::max(t - last_accepted_t_, 0.0));
   verdict.translation_limit = params_.max_translation +
-    params_.translation_per_meter * distance(odom_base, last_accepted_odom_);
+    params_.translation_per_meter * distance(odom_base, last_position_odom_);
   const auto reject = [&](Reason reason) {
       candidate_.reset();
       verdict.reason = reason;
@@ -99,6 +99,8 @@ StationaryCorrection::Verdict StationaryCorrection::evaluate(
   const bool agrees = candidate_ &&
     headingDifference(matched, *candidate_) <= params_.agree_heading;
   const bool first = !candidate_;
+  verdict.position = agrees && params_.agree_translation > 0.0 &&
+    distance(matched, *candidate_) <= params_.agree_translation;
   candidate_ = matched;
   if (!agrees) {
     verdict.reason = first ? Reason::FirstMatch : Reason::Disagree;
@@ -107,7 +109,9 @@ StationaryCorrection::Verdict StationaryCorrection::evaluate(
   verdict.accepted = true;
   verdict.reason = Reason::Accepted;
   last_accepted_t_ = t;
-  last_accepted_odom_ = odom_base;
+  if (verdict.position) {
+    last_position_odom_ = odom_base;
+  }
   return verdict;
 }
 
@@ -121,7 +125,7 @@ void StationaryCorrection::reset()
   rate_t_ = 0.0;
   last_attempt_t_ = 0.0;
   last_accepted_t_ = 0.0;
-  last_accepted_odom_ = karto::Pose2();
+  last_position_odom_ = karto::Pose2();
 }
 
 const char * StationaryCorrection::toString(Reason reason)

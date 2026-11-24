@@ -21,20 +21,23 @@
 // stop anywhere is stationary at once, with no scan added on arriving. Measured on the base, not
 // the sensor: a heading change swings the lidar's offset sideways.
 //
-// Only the heading is corrected: drift at rest only turns the heading, while the match's position
-// can be ambiguous (along a corridor) and the robot has not moved; the position error from the
-// drive there is corrected by the next scan added. A match is accepted when it is plausible as
-// drift, from the last accepted pose:
+// A match is accepted when it is plausible as drift, from the last accepted pose:
 //   - response at least min_response,
 //   - heading change at most heading_floor + max_drift_rate * (time since the last accepted
 //     correction or graph scan), capped at heading_cap,
 //   - position change at most max_translation plus translation_per_meter of the odom distance
-//     travelled since the last accepted correction or graph scan (a stop away from the last graph
-//     scan carries the odometry error of the way there, and the matcher a small bias of its own),
-//     (a position far off means the scene is not what the map holds: people, a covered lidar),
+//     travelled since the position was last corrected (by an accepted correction or a graph
+//     scan): a stop away from the last graph scan carries the odometry error of the way there,
+//     and the matcher a small bias of its own (a position far off means the scene is not what
+//     the map holds: people, a covered lidar),
 // and its heading agrees with the previous attempt's (within agree_heading): a static scene
 // matches the same twice, people moving about do not. Otherwise the last accepted pose stays,
 // until the robot moves and a scan is added as usual.
+//
+// The heading is always corrected: drift at rest turns it. The position only when the match's
+// position also agrees with the previous attempt's (within agree_translation; 0: never): it
+// corrects the odometry error of the drive to the stop, but along a corridor the match's position
+// is ambiguous and jumps between attempts, and then only the heading is applied.
 
 #include <optional>
 
@@ -54,6 +57,7 @@ struct StationaryCorrectionParams
   double max_translation{0.0};      // m
   double translation_per_meter{0.0};
   double agree_heading{0.0};        // rad
+  double agree_translation{0.0};    // m
   double min_response{0.0};
 };
 
@@ -74,6 +78,7 @@ public:
   struct Verdict
   {
     bool accepted{false};
+    bool position{false};           // the position is corrected too, not only the heading
     Reason reason{Reason::NoMatch};
     double heading_limit{0.0};      // rad
     double translation_limit{0.0};  // m
@@ -108,10 +113,13 @@ public:
   // Forgets everything: the graph was replaced, or time went back.
   void reset();
 
-  // The pose an accepted match is applied as: its heading at the predicted position.
-  static karto::Pose2 applied(const karto::Pose2 & predicted, const karto::Pose2 & matched)
+  // The pose an accepted match is applied as: the match, or its heading at the predicted
+  // position when the verdict corrects the heading only.
+  static karto::Pose2 applied(
+    const karto::Pose2 & predicted, const karto::Pose2 & matched, const Verdict & verdict)
   {
-    return karto::Pose2(predicted.GetX(), predicted.GetY(), matched.GetHeading());
+    return verdict.position ? matched :
+           karto::Pose2(predicted.GetX(), predicted.GetY(), matched.GetHeading());
   }
 
   static const char * toString(Reason reason);
@@ -126,7 +134,7 @@ private:
   std::optional<double> rate_prev_t_;
   double last_attempt_t_{0.0};   // last graph scan or attempt
   double last_accepted_t_{0.0};  // last accepted correction or graph scan
-  karto::Pose2 last_accepted_odom_;  // odom base pose then
+  karto::Pose2 last_position_odom_;  // odom base pose at the last position correction
   std::optional<karto::Pose2> candidate_;  // the previous attempt's match, if plausible
 };
 
