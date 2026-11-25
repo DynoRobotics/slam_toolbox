@@ -97,6 +97,9 @@ protected:
 
   // Loaders
   void loadSerializedPoseGraph(std::unique_ptr<karto::Mapper> &, std::unique_ptr<karto::Dataset> &);
+  // Drops the graph and its scans and starts a new map in the same map frame (see the
+  // slam_toolbox/reset_map subscription).
+  void resetMap();
 
   // functional bits
   karto::LaserRangeFinder * getLaser(const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan);
@@ -175,6 +178,7 @@ protected:
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::DeserializePoseGraph>> ssDesserialize_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr extrinsic_seed_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr extrinsic_reset_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr reset_map_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr pause_sub_;
   // per extrinsic component (x/y, yaw)
   std::vector<rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr> extrinsic_estimate_subs_;
@@ -230,6 +234,9 @@ protected:
   // smapper_mutex_.
   std::optional<geometry_msgs::msg::Pose> pending_extrinsic_seed_;
   bool extrinsic_seed_received_ = false;
+  // Set by resetMap: the first scan of the new map is placed where map->odom puts it, so the map
+  // frame stays where it was. Guarded by smapper_mutex_.
+  bool place_first_scan_by_map_to_odom_ = false;
 
   // pluginlib
   pluginlib::ClassLoader<karto::ScanSolver> solver_loader_;

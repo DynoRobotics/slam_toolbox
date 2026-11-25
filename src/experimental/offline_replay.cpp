@@ -4,7 +4,8 @@
 //
 // Usage:
 //   offline_replay <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>]
-//     [--viz] [--rate <factor>] [--start <seconds>] --ros-args --params-file <slam params> [-p ...]
+//     [--viz] [--rate <factor>] [--start <seconds>] [--reset-at <seconds>]
+//     --ros-args --params-file <slam params> [-p ...]
 //
 // The bag needs the scan topic (scan_topic, e.g. /scan_filtered) and /tf, /tf_static.
 // /slam_toolbox/pause, when present (scan_offline writes scan_node's), pauses new
@@ -35,6 +36,9 @@
 // --start <seconds> skips the scans in the first <seconds> after the bag's first scan (by scan
 // stamp); slam starts on the first scan after that, with the transforms before it already in
 // the buffer.
+//
+// --reset-at <seconds> resets the map (as slam_toolbox/reset_map does) before the first scan
+// that many seconds after the bag's first scan.
 
 #include <sys/resource.h>
 
@@ -76,7 +80,7 @@ public:
 
   int run(
     const std::string & bag, const std::string & out_prefix, bool save, double rate,
-    double start_offset)
+    double start_offset, std::optional<double> reset_offset)
   {
     const auto start = std::chrono::steady_clock::now();
     rosbag2_storage::StorageOptions storage;
@@ -97,6 +101,15 @@ public:
     // --start: scans stamped before this are skipped (set from the first scan).
     std::optional<rclcpp::Time> start_at;
     std::size_t skipped = 0;
+    // --reset-at: set from the first scan, cleared once the map is reset.
+    std::optional<rclcpp::Time> reset_at;
+    const auto feed = [&](const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan) {
+        if (reset_at && rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) >= *reset_at) {
+          reset_at.reset();
+          resetMap();
+        }
+        timedCallback(scan);
+      };
 
     while (reader.has_next()) {
       if (!rclcpp::ok()) {
@@ -124,6 +137,10 @@ public:
         if (!start_at) {
           start_at = rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) +
             rclcpp::Duration::from_seconds(start_offset);
+          if (reset_offset) {
+            reset_at = rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) +
+              rclcpp::Duration::from_seconds(*reset_offset);
+          }
         }
         if (rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) < *start_at) {
           ++skipped;
@@ -161,7 +178,7 @@ public:
           if (rclcpp::Time(scan->header.stamp, RCL_ROS_TIME) > odom_until) {
             break;
           }
-          timedCallback(scan);
+          feed(scan);
         }
         pending.pop_front();
       }
@@ -177,7 +194,7 @@ public:
       if (const bool * pause = std::get_if<bool>(&item)) {
         setPaused(*pause);
       } else {
-        timedCallback(std::get<sensor_msgs::msg::LaserScan::ConstSharedPtr>(item));
+        feed(std::get<sensor_msgs::msg::LaserScan::ConstSharedPtr>(item));
       }
     }
 
@@ -531,13 +548,15 @@ int main(int argc, char ** argv)
   if (args.size() < 3) {
     std::fprintf(stderr,
       "Usage: %s <bag> <out_prefix> [--save] [--surface <file>] [--loop-surface <file>] "
-      "[--viz] [--rate <factor>] [--start <seconds>] --ros-args ...\n", argv[0]);
+      "[--viz] [--rate <factor>] [--start <seconds>] [--reset-at <seconds>] --ros-args ...\n",
+      argv[0]);
     return 1;
   }
   bool save = false;
   bool viz = false;
   double rate = 0.0;
   double start_offset = 0.0;
+  std::optional<double> reset_offset;
   std::string surface;
   std::string loop_surface;
   for (std::size_t i = 3; i < args.size(); i++) {
@@ -553,6 +572,8 @@ int main(int argc, char ** argv)
       rate = std::stod(args[++i]);
     } else if (args[i] == "--start" && i + 1 < args.size()) {
       start_offset = std::stod(args[++i]);
+    } else if (args[i] == "--reset-at" && i + 1 < args.size()) {
+      reset_offset = std::stod(args[++i]);
     } else {
       std::fprintf(stderr, "offline_replay: unknown argument %s\n", args[i].c_str());
       return 1;
@@ -578,7 +599,7 @@ int main(int argc, char ** argv)
     node->loop_surface_ = std::make_unique<std::ofstream>(loop_surface);
     *node->loop_surface_ << std::setprecision(6);
   }
-  const int result = node->run(args[1], args[2], save, rate, start_offset);
+  const int result = node->run(args[1], args[2], save, rate, start_offset, reset_offset);
   // std::_Exit below skips the streams' destructors; flush them here.
   if (node->surface_) {
     node->surface_->flush();

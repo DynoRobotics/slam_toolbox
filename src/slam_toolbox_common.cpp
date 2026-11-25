@@ -16,6 +16,7 @@
  */
 
 /* Author: Steven Macenski */
+#include <algorithm>
 #include <memory>
 #include <vector>
 #include <string>
@@ -144,6 +145,11 @@ void SlamToolbox::configure()
       pending_extrinsic_seed_ = geometry_msgs::msg::Pose();
       applyExtrinsicSeed();
     });
+  // Starts a new map from the next scan without a restart (the operator panel's "Reset map").
+  // The pose and the map frame stay as they are, so what is stored in map coordinates (work
+  // areas, paths) still fits; the learned lidar extrinsic is kept.
+  reset_map_sub_ = this->create_subscription<std_msgs::msg::Empty>(
+    "slam_toolbox/reset_map", 10, [this](const std_msgs::msg::Empty &) {resetMap();});
   // Set-style counterpart to the pause_new_measurements toggle service: latched,
   // so repeats are harmless and a restarted slam_toolbox picks up the current
   // state. Scans keep arriving while paused, so map->odom keeps being stamped.
@@ -733,6 +739,13 @@ LocalizedRangeScan * SlamToolbox::addScan(
 
   // Add the localized range scan to the smapper
   boost::mutex::scoped_lock lock(smapper_mutex_);
+  // karto keeps a first scan's corrected pose (it predicts only from a previous scan).
+  if (place_first_scan_by_map_to_odom_ && processor_type_ == PROCESS) {
+    place_first_scan_by_map_to_odom_ = false;
+    boost::mutex::scoped_lock l(map_to_odom_mutex_);
+    range_scan->SetCorrectedPose(
+      smapper_->toKartoPose(map_to_odom_ * smapper_->toTfPose(odom_pose)));
+  }
   bool processed = false, update_reprocessing_transform = false;
 
   Matrix3 covariance;
@@ -1005,6 +1018,74 @@ void SlamToolbox::loadSerializedPoseGraph(
   }
 
   solver_->Compute();
+}
+
+/*****************************************************************************/
+void SlamToolbox::resetMap()
+/*****************************************************************************/
+{
+  boost::mutex::scoped_lock lock(smapper_mutex_);
+  RCLCPP_INFO(get_logger(), "Resetting the map: a new map starts from the next scan");
+
+  // Resetting the solver drops the extrinsic estimate; give it back as the seed it restarts from
+  // (corrections are relative to the nominal mount).
+  std::vector<std::pair<std::string, Pose2>> extrinsics;
+  for (const auto & [name, estimate] : solver_->GetSensorOffsetCorrections()) {
+    const Pose2 & nominal = solver_->GetSensorNominalOffsets().at(name);
+    extrinsics.emplace_back(name, karto::Transform(nominal).InverseTransformPose(estimate));
+    RCLCPP_INFO(get_logger(), "Keeping the %s extrinsic: yaw %.3f deg off the nominal mount",
+      name.c_str(), extrinsics.back().second.GetHeading() * 180.0 / M_PI);
+  }
+
+  // A new mapper (as when loading a pose graph) clears everything the old graph left behind.
+  smapper_->setMapper(new Mapper());
+  smapper_->configure(shared_from_this());
+  smapper_->getMapper()->SetScanSolver(solver_.get());
+  closure_assistant_->setMapper(smapper_->getMapper());
+  solver_->Reset();
+
+  // The dataset owns the scans; the lasers stay.
+  std::vector<LocalizedRangeScan *> scans;
+  for (const auto & [id, data] : dataset_->GetData()) {
+    if (auto * scan = dynamic_cast<LocalizedRangeScan *>(data)) {
+      scans.push_back(scan);
+    }
+  }
+  for (LocalizedRangeScan * scan : scans) {
+    dataset_->RemoveData(scan);
+  }
+
+  for (const auto & [name, correction] : extrinsics) {
+    solver_->SetSensorOffsetCorrection(correction);
+    for (auto & [frame, metadata] : lasers_) {
+      LaserRangeFinder * laser = metadata.getLaser();
+      Pose2 estimate;
+      if (laser->GetName().ToString() == name &&
+        solver_->InitializeSensorOffset(name, solver_->GetSensorNominalOffsets().at(name),
+        estimate))
+      {
+        laser->SetOffsetPose(estimate);
+      }
+    }
+  }
+  closure_assistant_->updateExtrinsicCalibration();
+
+  processor_type_ = PROCESS;
+  place_first_scan_by_map_to_odom_ = true;
+  first_measurement_ = true;
+  if (stationary_) {
+    stationary_->reset();
+  }
+
+  // The map and graph are next published from the new graph only after map_update_interval;
+  // until then show them cleared (the map all unknown, same extent, so the map display keeps its
+  // framing).
+  if (!map_.map.data.empty()) {
+    std::fill(map_.map.data.begin(), map_.map.data.end(), -1);
+    map_.map.header.stamp = now();
+    sst_->publish(std::make_unique<nav_msgs::msg::OccupancyGrid>(map_.map));
+  }
+  closure_assistant_->publishGraph();
 }
 
 /*****************************************************************************/

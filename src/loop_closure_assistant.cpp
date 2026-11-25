@@ -192,7 +192,18 @@ void LoopClosureAssistant::publishGraph()
   interactive_server_->clear();
   auto graph = solver_->getGraph();
 
-  if (graph->size() == 0) {
+  visualization_msgs::msg::MarkerArray marray;
+
+  // clear existing markers to account for any removed nodes
+  visualization_msgs::msg::Marker clear;
+  clear.header.stamp = node_->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  marray.markers.push_back(clear);
+
+  // An empty graph (a reset map) still clears the old one.
+  if (graph->size() == 0 || !mapper_->GetGraph()) {
+    interactive_server_->applyChanges();
+    marker_publisher_->publish(marray);
     return;
   }
 
@@ -211,14 +222,6 @@ void LoopClosureAssistant::publishGraph()
   if (!localization_vertices.empty()) {
     first_localization_id = localization_vertices.front().vertex->GetObject()->GetUniqueId();
   }
-
-  visualization_msgs::msg::MarkerArray marray;
-
-  // clear existing markers to account for any removed nodes
-  visualization_msgs::msg::Marker clear;
-  clear.header.stamp = node_->now();
-  clear.action = visualization_msgs::msg::Marker::DELETEALL;
-  marray.markers.push_back(clear);
 
   visualization_msgs::msg::Marker m = vis_utils::toMarker(map_frame_, "slam_toolbox", 0.1, node_);
 
